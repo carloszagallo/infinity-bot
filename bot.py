@@ -79,7 +79,7 @@ def analisar_com_claude(pergunta, titulo, descricao):
         "anthropic-version": "2023-06-01"
     }
     body = {
-        "model": "claude-sonnet-4-20250514",
+        "model": "claude-haiku-4-5-20251001",
         "max_tokens": 300,
         "system": SYSTEM_PROMPT,
         "messages": [{
@@ -93,7 +93,15 @@ def analisar_com_claude(pergunta, titulo, descricao):
             json=body, headers=headers, timeout=30
         )
         data = r.json()
-        return data["content"][0]["text"].strip()
+        log.info(f"Claude response status: {r.status_code}")
+        if "content" in data and len(data["content"]) > 0:
+            return data["content"][0]["text"].strip()
+        elif "error" in data:
+            log.error(f"Claude error: {data['error']}")
+            return "NAO_RESPONDER"
+        else:
+            log.error(f"Claude resposta inesperada: {data}")
+            return "NAO_RESPONDER"
     except Exception as e:
         log.error(f"Erro no Claude: {e}")
         return "NAO_RESPONDER"
