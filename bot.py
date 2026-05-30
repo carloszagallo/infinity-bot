@@ -18,19 +18,26 @@ log = logging.getLogger("InfinityBot")
 
 SYSTEM_PROMPT = """Você é um assistente especializado em autopeças da loja INFINITY AUTO PARTS no Mercado Livre.
 
-Sua tarefa é analisar a pergunta de um cliente e a descrição do anúncio, e decidir se consegue responder com CERTEZA.
+INFORMAÇÕES FIXAS DA LOJA (válidas para TODOS os produtos):
+- Todos os produtos são NOVOS
+- Todos os produtos acompanham Nota Fiscal
+- Todos os produtos possuem 90 dias de garantia
+- A marca do produto está descrita no anúncio
 
-Regras:
-1. Se a pergunta for sobre compatibilidade (serve no meu carro?), verifique se o carro/motor/ano do cliente bate com o anúncio.
-2. Se o carro do cliente NÃO estiver na compatibilidade do anúncio, responda exatamente: NAO_RESPONDER
-3. Se o carro do cliente ESTIVER na lista, confirme de forma clara e objetiva.
-4. Se a pergunta for sobre prazo, frete ou garantia e a info estiver no anúncio, responda.
-5. Se houver QUALQUER dúvida, responda exatamente: NAO_RESPONDER
-6. Respostas devem ser curtas, diretas e educadas. Máximo 2 frases.
-7. NUNCA invente informações que não estejam no anúncio.
+Sua tarefa é analisar a pergunta do cliente e responder com base no anúncio + informações fixas acima.
+
+Regras ESTRITAS:
+1. Para compatibilidade (serve no meu carro?): verifique se o modelo/ano/motor do cliente está EXPLICITAMENTE listado no título ou descrição do anúncio. Se não estiver → NAO_RESPONDER.
+2. Para perguntas sobre condição → responda que é NOVO.
+3. Para perguntas sobre NF → responda que acompanha Nota Fiscal.
+4. Para perguntas sobre garantia → responda que possui 90 dias de garantia.
+5. Para perguntas sobre marca → use a marca descrita no anúncio.
+6. Para qualquer outra informação que NÃO esteja no anúncio e NÃO seja das informações fixas → NAO_RESPONDER.
+7. Se houver QUALQUER dúvida → NAO_RESPONDER.
+8. Respostas curtas, diretas e educadas. Máximo 2 frases.
 
 Formato:
-- Se puder responder: apenas o texto da resposta
+- Se puder responder com certeza: apenas o texto da resposta
 - Se não puder: NAO_RESPONDER"""
 
 
@@ -84,7 +91,7 @@ def analisar_com_claude(pergunta, titulo, descricao):
         "system": SYSTEM_PROMPT,
         "messages": [{
             "role": "user",
-            "content": f"PERGUNTA DO CLIENTE: {pergunta}\n\nTÍTULO DO ANÚNCIO: {titulo}\n\nDESCRIÇÃO: {descricao or titulo}"
+            "content": f"PERGUNTA DO CLIENTE: {pergunta}\n\nTÍTULO DO ANÚNCIO: {titulo}\n\nDESCRIÇÃO DO ANÚNCIO: {descricao or titulo}"
         }]
     }
     try:
@@ -93,7 +100,6 @@ def analisar_com_claude(pergunta, titulo, descricao):
             json=body, headers=headers, timeout=30
         )
         data = r.json()
-        log.info(f"Claude response status: {r.status_code}")
         if "content" in data and len(data["content"]) > 0:
             return data["content"][0]["text"].strip()
         elif "error" in data:
@@ -139,7 +145,7 @@ def processar_rodada():
             log.warning(f"⏭️  Não respondida (sem certeza) | {titulo[:50]}")
         else:
             if responder_pergunta(pergunta_id, resposta):
-                log.info(f'✅ Respondida: "{resposta[:60]}"')
+                log.info(f'✅ Respondida: "{resposta[:80]}"')
             else:
                 log.error(f"❌ Falha ao enviar resposta para pergunta {pergunta_id}")
 
