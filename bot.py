@@ -1,5 +1,3 @@
-rt time
-import requests
 import logging
 import smtplib
 from email.mime.text import MIMEText
@@ -307,23 +305,26 @@ def processar_promocoes(conta):
             stats[cid]["promocoes_ignoradas"] += 1
             continue
 
-        # Busca itens da promoção para verificar KERS (só seg-sex 08h-18h) e preço mínimo
-        res_items = mac_call("ml_promotion_items", {"promotion_id": promo_id}, meli_user_id=cid)
-        items_promo = []
-        if res_items.get("status") == 200:
-            items_promo = (res_items.get("data") or {}).get("results", [])
-
+        # Busca itens da promoção para verificar KERS e preço mínimo
         bloqueada = False
-        for it in items_promo:
-            item_id = it.get("item_id") or it.get("id")
-            if not item_id:
-                continue
-            permitido, motivo = item_permitido_para_promocao(item_id, desconto, cid)
-            if not permitido:
-                log.warning(f"[{nome}] 🚫 Promoção bloqueada — {motivo}: {nome_p}")
-                stats[cid]["promocoes_ignoradas"] += 1
-                bloqueada = True
-                break
+        try:
+            res_items = mac_call("ml_promotion_items", {"promotion_id": promo_id, "limit": 10}, meli_user_id=cid)
+            items_promo = []
+            if res_items.get("status") == 200:
+                items_promo = (res_items.get("data") or {}).get("results", [])
+
+            for it in items_promo[:5]:  # verifica até 5 itens por promoção
+                item_id = it.get("item_id") or it.get("id")
+                if not item_id:
+                    continue
+                permitido, motivo = item_permitido_para_promocao(item_id, desconto, cid)
+                if not permitido:
+                    log.warning(f"[{nome}] 🚫 Bloqueada — {motivo}: {nome_p}")
+                    stats[cid]["promocoes_ignoradas"] += 1
+                    bloqueada = True
+                    break
+        except Exception as e:
+            log.warning(f"[{nome}] ⚠️  Erro ao verificar itens de {nome_p}: {e}")
 
         if bloqueada:
             continue
