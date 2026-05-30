@@ -20,8 +20,9 @@ MAC_BASE_URL     = "https://mcp.tiops.com.br/marketplace"
 # ── Contas ML ──────────────────────────────────────────────────
 CONTAS_ML = [
     {"id": 60771984,  "nome": "INFINITY AUTOPARTS"},
-    {"id": 233798434, "nome": "FREEDOM ML2"},
+    {"id": 233798434, "nome": "FREEDOM"},
     {"id": 554248644, "nome": "AUTOPARTSLIBERTY"},
+    {"id": 1994875400,"nome": "DESTINYAUTOPARTS"},
 ]
 
 logging.basicConfig(
