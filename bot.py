@@ -38,7 +38,12 @@ Formato:
 # ── Funções da MAC API ──────────────────────────────────────────
 def mac_call(action, params=None):
     payload = {"action": action, "params": params or {}}
-    headers = {"Content-Type": "application/json", "X-MAC-Key": MAC_API_KEY}
+    headers = {
+        "Content-Type": "application/json",
+        "X-MAC-Key": MAC_API_KEY,
+        "Authorization": f"Bearer {MAC_API_KEY}",
+        "x-api-key": MAC_API_KEY
+    }
     try:
         r = requests.post(MAC_BASE_URL, json=payload, headers=headers, timeout=30)
         return r.json()
