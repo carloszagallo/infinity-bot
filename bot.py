@@ -290,13 +290,25 @@ def processar_promocoes(conta):
         copart_ml = float(promo.get("marketplace_discount_percentage", 0) or 0)
         meu_desc  = round(desconto - copart_ml, 2)
 
+        # Verifica horário comercial (seg-sex 08h-18h) para regras KERS/preço
+        agora_local = datetime.now()
+        horario_comercial = (agora_local.weekday() < 5 and 8 <= agora_local.hour < 18)
+
+        # Promoção FLEXÍVEL — participa com desconto mínimo (6%)
+        sub_type = promo.get("sub_type", "")
+        if sub_type == "FLEXIBLE_PERCENTAGE":
+            desconto  = 6.0
+            copart_ml = float(promo.get("marketplace_discount_percentage", 0) or 0)
+            meu_desc  = round(desconto - copart_ml, 2)
+            log.info(f"[{nome}] 🔧 Promoção flexível — usando desconto mínimo 6%: {nome_p}")
+
         # Verifica desconto máximo
         if meu_desc > MAX_DESCONTO_MEU:
             log.warning(f"[{nome}] ❌ Ignorada ({meu_desc}% > {MAX_DESCONTO_MEU}%): {nome_p}")
             stats[cid]["promocoes_ignoradas"] += 1
             continue
 
-        # Busca itens da promoção para verificar KERS e preço mínimo
+        # Busca itens da promoção para verificar KERS (só seg-sex 08h-18h) e preço mínimo
         res_items = mac_call("ml_promotion_items", {"promotion_id": promo_id}, meli_user_id=cid)
         items_promo = []
         if res_items.get("status") == 200:
@@ -318,12 +330,15 @@ def processar_promocoes(conta):
             continue
 
         # Tudo ok — ativa a promoção
-        res2 = mac_call("ml_update_promotion", {"promotion_id": promo_id, "status": "started"}, meli_user_id=cid)
+        params_ativacao = {"promotion_id": promo_id, "status": "started"}
+        if sub_type == "FLEXIBLE_PERCENTAGE":
+            params_ativacao["discount_percentage"] = desconto
+        res2 = mac_call("ml_update_promotion", params_ativacao, meli_user_id=cid)
         if res2.get("status") in [200, 201]:
             log.info(f"[{nome}] 🏷️  Ativada: {nome_p} ({meu_desc}%)")
             stats[cid]["promocoes_ativadas"] += 1
         else:
-            log.warning(f"[{nome}] ⚠️  Não ativou: {nome_p}")
+            log.warning(f"[{nome}] ⚠️  Não ativou: {nome_p} — {res2.get('error','')}")
 
 
 # ── LOOP PRINCIPAL ─────────────────────────────────────────────
