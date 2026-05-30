@@ -1,3 +1,6 @@
+import os
+import time
+import requests
 import logging
 import smtplib
 from email.mime.text import MIMEText
