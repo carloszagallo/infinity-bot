@@ -1,5 +1,4 @@
-import os
-import time
+rt time
 import requests
 import logging
 import smtplib
@@ -396,4 +395,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
