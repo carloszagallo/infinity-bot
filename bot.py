@@ -232,6 +232,40 @@ def processar_avaliacoes(conta):
 
 
 # ── PROMOÇÕES ──────────────────────────────────────────────────
+MARCAS_BLOQUEADAS  = ["kers", "KERS", "Kers"]
+PRECO_MINIMO       = float(os.environ.get("PRECO_MINIMO", "19.0"))
+
+
+def item_permitido_para_promocao(item_id, desconto_pct, cid):
+    """Retorna (permitido, motivo) verificando marca KERS e preço mínimo."""
+    res = mac_call("get_items", {"ids": [item_id]}, meli_user_id=cid)
+    if res.get("status") != 200:
+        return False, "não foi possível verificar o item"
+    items = res.get("data") or []
+    if not items or items[0].get("code") != 200:
+        return False, "item não encontrado"
+
+    item  = items[0]["body"]
+    preco = float(item.get("price", 0) or 0)
+    attrs = item.get("attributes") or []
+    marca = ""
+    for a in attrs:
+        if a.get("id") == "BRAND":
+            marca = (a.get("value_name") or "").strip()
+            break
+
+    # Verifica marca KERS
+    if any(k.lower() in marca.lower() for k in MARCAS_BLOQUEADAS):
+        return False, f"marca KERS bloqueada ({marca})"
+
+    # Verifica preço mínimo após desconto
+    preco_final = round(preco * (1 - desconto_pct / 100), 2)
+    if preco_final < PRECO_MINIMO:
+        return False, f"preço final R$ {preco_final:.2f} abaixo do mínimo R$ {PRECO_MINIMO:.2f}"
+
+    return True, "ok"
+
+
 def processar_promocoes(conta):
     cid  = conta["id"]
     nome = conta["nome"]
@@ -256,16 +290,40 @@ def processar_promocoes(conta):
         copart_ml = float(promo.get("marketplace_discount_percentage", 0) or 0)
         meu_desc  = round(desconto - copart_ml, 2)
 
-        if meu_desc <= MAX_DESCONTO_MEU:
-            res2 = mac_call("ml_update_promotion", {"promotion_id": promo_id, "status": "started"}, meli_user_id=cid)
-            if res2.get("status") in [200, 201]:
-                log.info(f"[{nome}] 🏷️  Ativada: {nome_p} ({meu_desc}%)")
-                stats[cid]["promocoes_ativadas"] += 1
-            else:
-                log.warning(f"[{nome}] ⚠️  Não ativou: {nome_p}")
-        else:
+        # Verifica desconto máximo
+        if meu_desc > MAX_DESCONTO_MEU:
             log.warning(f"[{nome}] ❌ Ignorada ({meu_desc}% > {MAX_DESCONTO_MEU}%): {nome_p}")
             stats[cid]["promocoes_ignoradas"] += 1
+            continue
+
+        # Busca itens da promoção para verificar KERS e preço mínimo
+        res_items = mac_call("ml_promotion_items", {"promotion_id": promo_id}, meli_user_id=cid)
+        items_promo = []
+        if res_items.get("status") == 200:
+            items_promo = (res_items.get("data") or {}).get("results", [])
+
+        bloqueada = False
+        for it in items_promo:
+            item_id = it.get("item_id") or it.get("id")
+            if not item_id:
+                continue
+            permitido, motivo = item_permitido_para_promocao(item_id, desconto, cid)
+            if not permitido:
+                log.warning(f"[{nome}] 🚫 Promoção bloqueada — {motivo}: {nome_p}")
+                stats[cid]["promocoes_ignoradas"] += 1
+                bloqueada = True
+                break
+
+        if bloqueada:
+            continue
+
+        # Tudo ok — ativa a promoção
+        res2 = mac_call("ml_update_promotion", {"promotion_id": promo_id, "status": "started"}, meli_user_id=cid)
+        if res2.get("status") in [200, 201]:
+            log.info(f"[{nome}] 🏷️  Ativada: {nome_p} ({meu_desc}%)")
+            stats[cid]["promocoes_ativadas"] += 1
+        else:
+            log.warning(f"[{nome}] ⚠️  Não ativou: {nome_p}")
 
 
 # ── LOOP PRINCIPAL ─────────────────────────────────────────────
@@ -323,3 +381,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
