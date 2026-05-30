@@ -372,7 +372,7 @@ def main():
                     processar_avaliacoes(conta)
 
             # Promoções — a cada 6h
-            if ultima_promo is None or (agora - ultima_promo) >= timedelta(hours=6):
+            if ultima_promo is None or (agora - ultima_promo) >= timedelta(minutes=2):
                 for conta in CONTAS_ML:
                     processar_promocoes(conta)
                 ultima_promo = agora
@@ -399,3 +399,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
