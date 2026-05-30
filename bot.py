@@ -2,7 +2,6 @@ import os
 import time
 import requests
 import logging
-from datetime import datetime
 
 # ── Configurações ──────────────────────────────────────────────
 MAC_API_KEY    = os.environ.get("MAC_API_KEY", "")
@@ -40,8 +39,6 @@ def mac_call(action, params=None):
     payload = {"action": action, "params": params or {}}
     headers = {
         "Content-Type": "application/json",
-        "X-MAC-Key": MAC_API_KEY,
-        "Authorization": f"Bearer {MAC_API_KEY}",
         "x-api-key": MAC_API_KEY
     }
     try:
@@ -63,7 +60,7 @@ def buscar_perguntas():
 def buscar_anuncio(item_id):
     res = mac_call("get_items", {"ids": [item_id], "include_description": True})
     if res.get("status") == 200:
-        items = res["data"] or []
+        items = res.get("data") or []
         if items and items[0].get("code") == 200:
             return items[0]["body"]
     return None
@@ -144,10 +141,10 @@ def main():
     log.info(f"   Intervalo: {INTERVALO_SEG}s")
 
     if not MAC_API_KEY:
-        log.error("❌ MAC_API_KEY não configurada! Defina a variável de ambiente.")
+        log.error("❌ MAC_API_KEY não configurada!")
         return
     if not CLAUDE_API_KEY:
-        log.error("❌ CLAUDE_API_KEY não configurada! Defina a variável de ambiente.")
+        log.error("❌ CLAUDE_API_KEY não configurada!")
         return
 
     while True:
