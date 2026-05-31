@@ -146,7 +146,7 @@ def processar_conta(conta):
 
     offset = 0
     total_processados = 0
-    MAX_ANUNCIOS = 500  # processa até 500 por rodada
+    MAX_ANUNCIOS = 25000  # processa todos os anúncios
 
     while total_processados < MAX_ANUNCIOS:
         res = mac_call("list_items", {
