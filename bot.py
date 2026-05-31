@@ -16,8 +16,8 @@ EMAIL_DESTINO    = os.environ.get("EMAIL_DESTINO", "carloszagallo@gmail.com")
 # E-mail agora via HTTP (Resend) — SMTP é bloqueado no Railway
 RESEND_API_KEY   = os.environ.get("RESEND_API_KEY", "")
 EMAIL_FROM       = os.environ.get("EMAIL_FROM", "Infinity Bot <onboarding@resend.dev>")
-TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN",8786123063:AAGFFb83F65oawDnP6WnhG_lST2ZfioVb9k "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID",8611566347 "")
+TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 INTERVALO_SEG    = int(os.environ.get("INTERVALO_SEG", "30"))
 MAX_DESCONTO_MEU = float(os.environ.get("MAX_DESCONTO_MEU", "7.0"))
 MAC_BASE_URL     = "https://mcp.tiops.com.br/marketplace"
