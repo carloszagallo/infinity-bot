@@ -16,6 +16,8 @@ EMAIL_DESTINO    = os.environ.get("EMAIL_DESTINO", "carloszagallo@gmail.com")
 # E-mail agora via HTTP (Resend) — SMTP é bloqueado no Railway
 RESEND_API_KEY   = os.environ.get("RESEND_API_KEY", "")
 EMAIL_FROM       = os.environ.get("EMAIL_FROM", "Infinity Bot <onboarding@resend.dev>")
+TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN",8786123063:AAGFFb83F65oawDnP6WnhG_lST2ZfioVb9k "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID",8611566347 "")
 INTERVALO_SEG    = int(os.environ.get("INTERVALO_SEG", "30"))
 MAX_DESCONTO_MEU = float(os.environ.get("MAX_DESCONTO_MEU", "7.0"))
 MAC_BASE_URL     = "https://mcp.tiops.com.br/marketplace"
@@ -249,33 +251,66 @@ def enviar_email(assunto, corpo_html):
         log.error(f"Erro email: {e}")
 
 
+# ── TELEGRAM ───────────────────────────────────────────────────
+def enviar_telegram(texto):
+    if not (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID):
+        return False
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": texto, "parse_mode": "HTML",
+                  "disable_web_page_preview": True},
+            timeout=20,
+        )
+        if r.status_code == 200:
+            log.info("📲 Relatório enviado no Telegram")
+            return True
+        log.error(f"Erro Telegram ({r.status_code}): {r.text[:200]}")
+    except Exception as e:
+        log.error(f"Erro Telegram: {e}")
+    return False
+
+
 def enviar_relatorio():
     agora = agora_br()
-    linhas = ""
+
+    # Versão texto pro Telegram
+    tg = [f"📊 <b>Relatório Infinity Bot</b>", f"🕐 {agora.strftime('%d/%m/%Y às %H:%M')}", ""]
     for c in CONTAS_ML:
         s = stats[c["id"]]
-        linhas += f"""
-        <tr><td colspan="2" style="background:#1a1a2e;color:#fff;padding:8px"><b>{c['nome']}</b></td></tr>
-        <tr style="background:#f9f9f9"><td>💬 Perguntas respondidas</td><td><b style="color:#2ecc71">{s['perguntas_respondidas']}</b></td></tr>
-        <tr><td>⏭️ Deixadas para você</td><td><b style="color:#e67e22">{s['perguntas_ignoradas']}</b></td></tr>
-        <tr style="background:#f9f9f9"><td>⭐ Avaliações respondidas</td><td><b style="color:#2ecc71">{s['avaliacoes_respondidas']}</b></td></tr>
-        <tr><td>🏷️ Promoções ativadas</td><td><b style="color:#2ecc71">{s['promocoes_ativadas']}</b></td></tr>
-        <tr style="background:#f9f9f9"><td>❌ Promoções ignoradas (+7%)</td><td><b style="color:#e74c3c">{s['promocoes_ignoradas']}</b></td></tr>
-        """
+        tg.append(f"<b>{c['nome']}</b>")
+        tg.append(f"💬 Respondidas: {s['perguntas_respondidas']}   ⏭️ Pra você: {s['perguntas_ignoradas']}")
+        tg.append(f"⭐ Avaliações: {s['avaliacoes_respondidas']}")
+        tg.append(f"🏷️ Promoções ativadas: {s['promocoes_ativadas']}   ❌ Ignoradas: {s['promocoes_ignoradas']}")
+        tg.append("")
+    enviado = enviar_telegram("\n".join(tg))
 
-    corpo = f"""
-    <html><body style="font-family:Arial,sans-serif;max-width:600px;margin:auto">
-    <h2 style="color:#1a1a2e">📊 Relatório Infinity Bot</h2>
-    <p style="color:#666">{agora.strftime('%d/%m/%Y às %H:%M')}</p>
-    <hr>
-    <table width="100%" cellpadding="10" style="border-collapse:collapse">
-    {linhas}
-    </table>
-    <hr>
-    <p style="color:#999;font-size:12px">Infinity Bot • 4 contas ML monitoradas</p>
-    </body></html>
-    """
-    enviar_email(f"📊 Infinity Bot — {agora.strftime('%d/%m %H:%M')}", corpo)
+    # Reserva: se o Telegram não estiver configurado/falhar, manda e-mail
+    if not enviado:
+        linhas = ""
+        for c in CONTAS_ML:
+            s = stats[c["id"]]
+            linhas += f"""
+            <tr><td colspan="2" style="background:#1a1a2e;color:#fff;padding:8px"><b>{c['nome']}</b></td></tr>
+            <tr style="background:#f9f9f9"><td>💬 Perguntas respondidas</td><td><b style="color:#2ecc71">{s['perguntas_respondidas']}</b></td></tr>
+            <tr><td>⏭️ Deixadas para você</td><td><b style="color:#e67e22">{s['perguntas_ignoradas']}</b></td></tr>
+            <tr style="background:#f9f9f9"><td>⭐ Avaliações respondidas</td><td><b style="color:#2ecc71">{s['avaliacoes_respondidas']}</b></td></tr>
+            <tr><td>🏷️ Promoções ativadas</td><td><b style="color:#2ecc71">{s['promocoes_ativadas']}</b></td></tr>
+            <tr style="background:#f9f9f9"><td>❌ Promoções ignoradas (+7%)</td><td><b style="color:#e74c3c">{s['promocoes_ignoradas']}</b></td></tr>
+            """
+        corpo = f"""
+        <html><body style="font-family:Arial,sans-serif;max-width:600px;margin:auto">
+        <h2 style="color:#1a1a2e">📊 Relatório Infinity Bot</h2>
+        <p style="color:#666">{agora.strftime('%d/%m/%Y às %H:%M')}</p>
+        <hr>
+        <table width="100%" cellpadding="10" style="border-collapse:collapse">
+        {linhas}
+        </table>
+        <hr>
+        <p style="color:#999;font-size:12px">Infinity Bot • 4 contas ML monitoradas</p>
+        </body></html>
+        """
+        enviar_email(f"📊 Infinity Bot — {agora.strftime('%d/%m %H:%M')}", corpo)
 
     if agora.hour >= 19:
         for c in CONTAS_ML:
