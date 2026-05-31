@@ -26,7 +26,8 @@ MAC_BASE_URL = "https://mcp.tiops.com.br/marketplace"
 
 APLICAR        = os.environ.get("APLICAR", "false").lower() == "true"
 MODO           = os.environ.get("MODO", "full").lower()          # full | incremental
-STATUS_ALVO    = os.environ.get("STATUS_ALVO", "active")          # active | paused
+STATUS_ALVO    = os.environ.get("STATUS_ALVO", "active")          # active | paused | all
+SUB_STATUS     = os.environ.get("SUB_STATUS", "").strip()         # ex.: waiting_for_patch (vazio = todos)
 MAX_ITENS      = int(os.environ.get("MAX_ITENS", "0"))            # 0 = todos (full) / 500 (incremental)
 INTERVALO_DIAS = float(os.environ.get("INTERVALO_DIAS", "0"))     # 0 = roda 1x
 PAUSA          = float(os.environ.get("PAUSA", "0.25"))
@@ -66,7 +67,12 @@ def listar(cid):
     cap = MAX_ITENS if MAX_ITENS else (500 if MODO == "incremental" else 0)
     ids, offset = [], 0
     while True:
-        p = f"/users/{cid}/items/search?status={STATUS_ALVO}&sort={sort}&limit=50&offset={offset}"
+        q = [f"sort={sort}", "limit=50", f"offset={offset}"]
+        if STATUS_ALVO and STATUS_ALVO.lower() != "all":
+            q.append(f"status={STATUS_ALVO}")
+        if SUB_STATUS:
+            q.append(f"sub_status={SUB_STATUS}")
+        p = f"/users/{cid}/items/search?" + "&".join(q)
         res = mac("raw", {"method": "GET", "path": p}, meli_user_id=cid)
         if res.get("status") != 200:
             break
@@ -167,7 +173,8 @@ def aplica(cid, iid, attrs, sale_terms):
 
 def run_once():
     modo_txt = "APLICANDO (escrita real)" if APLICAR else "DRY-RUN (só simula)"
-    log.info(f"🤖 Funcionário Digital — modo={MODO} | status={STATUS_ALVO} | {modo_txt}")
+    alvo = f"{STATUS_ALVO}" + (f"/{SUB_STATUS}" if SUB_STATUS else "")
+    log.info(f"🤖 Funcionário Digital — modo={MODO} | alvo={alvo} | {modo_txt}")
     tot = {"itens": 0, "inmetro": 0, "origem": 0, "codigos": 0, "garantia": 0,
            "titulo_alerta": 0, "escritos": 0, "erros": 0}
     for c in CONTAS_ML:
