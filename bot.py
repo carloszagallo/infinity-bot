@@ -2,17 +2,15 @@ import os
 import time
 import requests
 import logging
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timedelta
 
 # ── Configurações ──────────────────────────────────────────────
 MAC_API_KEY      = os.environ.get("MAC_API_KEY", "")
 CLAUDE_API_KEY   = os.environ.get("CLAUDE_API_KEY", "")
-GMAIL_USER       = os.environ.get("GMAIL_USER", "")
-GMAIL_APP_PASS   = os.environ.get("GMAIL_APP_PASS", "")
 EMAIL_DESTINO    = os.environ.get("EMAIL_DESTINO", "carloszagallo@gmail.com")
+# E-mail agora via HTTP (Resend) — SMTP é bloqueado no Railway
+RESEND_API_KEY   = os.environ.get("RESEND_API_KEY", "")
+EMAIL_FROM       = os.environ.get("EMAIL_FROM", "Infinity Bot <onboarding@resend.dev>")
 INTERVALO_SEG    = int(os.environ.get("INTERVALO_SEG", "30"))
 MAX_DESCONTO_MEU = float(os.environ.get("MAX_DESCONTO_MEU", "7.0"))
 MAC_BASE_URL     = "https://mcp.tiops.com.br/marketplace"
@@ -47,30 +45,93 @@ ultima_promo       = None
 ultimo_rel_manha   = None
 ultimo_rel_tarde   = None
 
-SYSTEM_PROMPT = """Você é um assistente especializado em autopeças no Mercado Livre.
+# Atributos do anúncio que ajudam a responder
+ATTR_UTEIS = {"BRAND", "MODEL", "PART_NUMBER", "OEM", "VEHICLE_TYPE",
+              "VEHICLE_BRAND", "VEHICLE_MODEL", "VEHICLE_YEAR", "LINE", "VERSION"}
 
-INFORMAÇÕES FIXAS (válidas para TODOS os produtos):
-- Todos os produtos são NOVOS
-- Todos acompanham Nota Fiscal
-- Todos possuem 90 dias de garantia
-- A marca está descrita no anúncio
+SYSTEM_PROMPT = """Você é o atendente de uma loja de autopeças no Mercado Livre, respondendo a pergunta de um cliente.
 
-Regras ESTRITAS:
-1. Compatibilidade: verifique se o modelo/ano/motor está EXPLICITAMENTE no anúncio. Se não → NAO_RESPONDER.
-2. Condição → NOVO.
-3. NF → acompanha Nota Fiscal.
-4. Garantia → 90 dias.
-5. Marca → use a do anúncio.
-6. Qualquer outra info não disponível → NAO_RESPONDER.
-7. Dúvida → NAO_RESPONDER.
-8. Máximo 2 frases, educado e direto.
+REGRA DE OURO: só responda se tiver CERTEZA ABSOLUTA, usando o ANÚNCIO COMPLETO fornecido abaixo
+(título, descrição, frete, estoque, preço, condição, atributos) e as informações fixas da loja.
+Se faltar qualquer certeza, responda EXATAMENTE: NAO_RESPONDER
+É melhor deixar pro vendedor do que arriscar uma resposta errada (ou um "não sei", que faz perder a venda).
 
-Formato: texto da resposta OU NAO_RESPONDER"""
+INFORMAÇÕES FIXAS DA LOJA (valem para TODOS os produtos):
+- Todos os produtos são NOVOS.
+- Todos acompanham Nota Fiscal.
+- Todos têm 90 dias de garantia.
+- A marca está informada no anúncio.
+
+COMO USAR O ANÚNCIO (leia TUDO antes de decidir):
+- Envio/frete: se "Frete grátis: Sim", confirme com simpatia que enviamos COM FRETE GRÁTIS pelo Mercado Livre.
+  Se enviamos pelo Mercado Envios, confirme que enviamos normalmente para todo o Brasil.
+- Estoque: se houver quantidade disponível, confirme que TEM em estoque e é pronta entrega.
+- PRAZO DE ENTREGA ("quando chega?"): você NÃO sabe a data exata para um CEP específico. Responda de forma
+  simpática: confirme que enviamos com frete grátis pelo Mercado Livre; explique que o prazo previsto aparece
+  na própria tela do anúncio ao calcular o frete e depende de quando a compra for feita; e tranquilize o cliente
+  de que, da nossa parte, postamos assim que o Mercado Livre liberar a etiqueta de envio. NUNCA prometa uma data específica.
+- Compatibilidade ("serve no carro X / ano Y"): só confirme se o modelo/ano estiver EXPLÍCITO no título,
+  descrição ou atributos. Se não estiver → NAO_RESPONDER.
+- Preço/desconto/parcelas além do que está no anúncio → NAO_RESPONDER.
+
+TOM: simpático, direto e profissional, em português do Brasil. No máximo 2 frases. Nunca invente nada.
+
+Formato da resposta: SOMENTE o texto final para o cliente, OU a palavra NAO_RESPONDER."""
 
 PROMPT_AVALIACAO = """Você é assistente de uma loja de autopeças no Mercado Livre.
 Escreva uma resposta calorosa e educada para uma avaliação positiva.
 Objetivo: agradecer e convidar o cliente a voltar.
 Máximo 2 frases. Varie o texto. Responda apenas com o texto."""
+
+# Frases que indicam incerteza — rede de segurança: se a IA escorregar e gerar um "não sei"
+# em prosa (sem a palavra NAO_RESPONDER), tratamos como pular e NÃO publicamos.
+SINAIS_DE_INCERTEZA = [
+    "nao_responder", "não sei", "nao sei", "não consigo", "nao consigo",
+    "não tenho certeza", "nao tenho certeza", "não posso responder", "nao posso responder",
+    "recomendo entrar em contato", "não menciona", "nao menciona", "não há informação",
+    "nao ha informacao", "consulte o vendedor", "outras plataformas", "não informa", "nao informa",
+]
+
+def deve_pular(resposta):
+    """True = NÃO publicar. Pega o NAO_RESPONDER e qualquer 'não sei' disfarçado em prosa."""
+    if not resposta:
+        return True
+    t = resposta.strip().lower()
+    return any(s in t for s in SINAIS_DE_INCERTEZA)
+
+
+def montar_contexto(anuncio):
+    """Transforma o anúncio inteiro num texto claro — incluindo frete, estoque e preço."""
+    ship = anuncio.get("shipping") or {}
+    frete_gratis = "Sim" if ship.get("free_shipping") else "Não"
+    envia_ml = "Sim (Mercado Envios)" if ship.get("mode") in ("me1", "me2") else "Verificar"
+    retirada = "Sim" if ship.get("local_pick_up") or ship.get("store_pick_up") else "Não"
+    estoque  = anuncio.get("available_quantity") or 0
+    preco    = anuncio.get("price")
+    condicao = "Novo" if anuncio.get("condition") == "new" else (anuncio.get("condition") or "")
+    descricao = anuncio.get("description") or ""
+
+    attrs = []
+    for a in anuncio.get("attributes", []):
+        if a.get("id") in ATTR_UTEIS:
+            v = a.get("value_name")
+            if v and v not in ("", "null", "N/A"):
+                attrs.append(f"{a.get('name', a.get('id'))}: {v}")
+
+    linhas = [
+        f"TÍTULO: {anuncio.get('title', '')}",
+        f"DESCRIÇÃO: {descricao or '(sem descrição)'}",
+        f"Condição: {condicao}",
+        f"Preço: R$ {preco}",
+        f"Estoque disponível: {estoque} unidade(s)",
+        f"Frete grátis: {frete_gratis}",
+        f"Enviamos pelo Mercado Livre: {envia_ml}",
+        f"Retirada local: {retirada}",
+        "Nota Fiscal: Sim | Garantia: 90 dias",
+    ]
+    if attrs:
+        linhas.append("Atributos: " + " | ".join(attrs))
+    return "\n".join(linhas)
 
 
 # ── MAC API ────────────────────────────────────────────────────
@@ -111,21 +172,22 @@ def chamar_claude(system, user_msg):
         return "NAO_RESPONDER"
 
 
-# ── EMAIL ──────────────────────────────────────────────────────
+# ── EMAIL (Resend HTTP) ────────────────────────────────────────
 def enviar_email(assunto, corpo_html):
-    if not GMAIL_USER or not GMAIL_APP_PASS:
-        log.warning("⚠️  Email não configurado")
+    if not RESEND_API_KEY:
+        log.warning("⚠️  RESEND_API_KEY não configurada — relatório não enviado por e-mail")
         return
     try:
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = assunto
-        msg["From"]    = GMAIL_USER
-        msg["To"]      = EMAIL_DESTINO
-        msg.attach(MIMEText(corpo_html, "html"))
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
-            s.login(GMAIL_USER, GMAIL_APP_PASS)
-            s.sendmail(GMAIL_USER, EMAIL_DESTINO, msg.as_string())
-        log.info(f"📧 Email enviado: {assunto}")
+        r = requests.post(
+            "https://api.resend.com/emails",
+            headers={"Authorization": f"Bearer {RESEND_API_KEY}", "Content-Type": "application/json"},
+            json={"from": EMAIL_FROM, "to": [EMAIL_DESTINO], "subject": assunto, "html": corpo_html},
+            timeout=30,
+        )
+        if r.status_code in (200, 201):
+            log.info(f"📧 Email enviado: {assunto}")
+        else:
+            log.error(f"Erro email (Resend {r.status_code}): {r.text[:200]}")
     except Exception as e:
         log.error(f"Erro email: {e}")
 
@@ -153,7 +215,7 @@ def enviar_relatorio():
     {linhas}
     </table>
     <hr>
-    <p style="color:#999;font-size:12px">Infinity Bot • 3 contas ML monitoradas</p>
+    <p style="color:#999;font-size:12px">Infinity Bot • 4 contas ML monitoradas</p>
     </body></html>
     """
     enviar_email(f"📊 Infinity Bot — {agora.strftime('%d/%m %H:%M')}", corpo)
@@ -186,16 +248,17 @@ def processar_perguntas(conta):
         if not items or items[0].get("code") != 200:
             continue
 
-        anuncio   = items[0]["body"]
-        titulo    = anuncio.get("title", "")
-        descricao = anuncio.get("description") or titulo
+        anuncio  = items[0]["body"]
+        titulo   = anuncio.get("title", "")
+        contexto = montar_contexto(anuncio)
 
         log.info(f'[{nome}] 💬 "{q["text"][:60]}"')
         resposta = chamar_claude(SYSTEM_PROMPT,
-            f"PERGUNTA: {q['text']}\n\nTÍTULO: {titulo}\n\nDESCRIÇÃO: {descricao}")
+            f"PERGUNTA DO CLIENTE: {q['text']}\n\nANÚNCIO:\n{contexto}")
 
-        if "NAO_RESPONDER" in resposta:
-            log.warning(f"[{nome}] ⏭️  Não respondida | {titulo[:40]}")
+        # Trava: NAO_RESPONDER explícito OU qualquer incerteza em prosa → não publica
+        if deve_pular(resposta):
+            log.warning(f"[{nome}] ⏭️  Deixada para você | {titulo[:40]}")
             stats[cid]["perguntas_ignoradas"] += 1
         else:
             res2 = mac_call("answer_question", {"question_id": q["id"], "text": resposta}, meli_user_id=cid)
@@ -399,4 +462,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
