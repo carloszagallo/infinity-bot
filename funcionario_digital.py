@@ -123,7 +123,7 @@ def planeja(item):
     novos_attrs, sale_terms, alertas = [], None, []
 
     if "INMETRO_CERTIFICATION_REGISTRATION_NUMBER" in am and vazio(am["INMETRO_CERTIFICATION_REGISTRATION_NUMBER"]):
-        novos_attrs.append({"id": "INMETRO_CERTIFICATION_REGISTRATION_NUMBER", "value_id": INMETRO_NA})
+        novos_attrs.append({"id": "INMETRO_CERTIFICATION_REGISTRATION_NUMBER", "value_name": "N/A"})
 
     if "ORIGIN" in am and vazio(am["ORIGIN"]):
         novos_attrs.append({"id": "ORIGIN", "value_id": ORIGEM_CHINA})
@@ -168,7 +168,19 @@ def aplica(cid, iid, attrs, sale_terms):
         body["sale_terms"] = sale_terms
     if not body:
         return None
-    return mac("raw", {"method": "PUT", "path": f"/items/{iid}", "body": body}, meli_user_id=cid)
+    r = mac("raw", {"method": "PUT", "path": f"/items/{iid}", "body": body}, meli_user_id=cid)
+    # Se falhou e o INMETRO estava no meio, tenta DE NOVO sem o INMETRO —
+    # pra um INMETRO problemático não derrubar as correções boas (OEM, Nº de peça, etc).
+    if r and r.get("status") != 200 and attrs:
+        sem_inmetro = [a for a in attrs if a.get("id") != "INMETRO_CERTIFICATION_REGISTRATION_NUMBER"]
+        if sem_inmetro != attrs and (sem_inmetro or sale_terms):
+            body2 = {}
+            if sem_inmetro:
+                body2["attributes"] = sem_inmetro
+            if sale_terms:
+                body2["sale_terms"] = sale_terms
+            r = mac("raw", {"method": "PUT", "path": f"/items/{iid}", "body": body2}, meli_user_id=cid)
+    return r
 
 
 def run_once():
