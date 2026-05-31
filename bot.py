@@ -3,6 +3,11 @@ import time
 import requests
 import logging
 from datetime import datetime, timedelta
+try:
+    from zoneinfo import ZoneInfo
+    TZ_BR = ZoneInfo("America/Sao_Paulo")
+except Exception:
+    TZ_BR = None
 
 # ── Configurações ──────────────────────────────────────────────
 MAC_API_KEY      = os.environ.get("MAC_API_KEY", "")
@@ -29,6 +34,27 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S"
 )
 log = logging.getLogger("InfinityBot")
+
+
+def agora_br():
+    """Horário do Brasil — o Railway roda em UTC, então sem isso a saudação saía 3h adiantada."""
+    if TZ_BR:
+        return datetime.now(TZ_BR)
+    return datetime.utcnow() - timedelta(hours=3)   # Brasil é UTC-3 (sem horário de verão)
+
+
+def saudacao_do_horario():
+    h = agora_br().hour
+    if 5 <= h < 12:
+        return "bom dia"
+    if 12 <= h < 18:
+        return "boa tarde"
+    return "boa noite"
+
+
+# Apelidos já buscados e clientes já saudados NESTA sessão (saudação só na 1ª resposta)
+_nick_cache = {}
+_ja_saudados = set()
 
 # ── Stats por conta ────────────────────────────────────────────
 def novo_stats():
@@ -76,6 +102,9 @@ SÓ NAO_RESPONDER QUANDO:
 - Qualquer coisa que dependa de informação fora do anúncio.
 
 TOM: simpático, direto e profissional, em português do Brasil, no máximo 2 frases.
+
+IMPORTANTE: NÃO inclua saudação (bom dia / olá / etc.) nem despedida no texto — responda direto ao ponto.
+A saudação com o nome do cliente é adicionada automaticamente quando for a primeira resposta.
 
 EXEMPLOS:
 Pergunta: "Vocês enviam?"
@@ -162,6 +191,20 @@ def mac_call(action, params=None, meli_user_id=None):
         return {"status": 500, "error": str(e)}
 
 
+def buscar_apelido(cid, from_id):
+    """Apelido (nickname) do comprador no ML. O ML não expõe o nome real, só o apelido."""
+    if not from_id:
+        return ""
+    if from_id in _nick_cache:
+        return _nick_cache[from_id]
+    apelido = ""
+    res = mac_call("raw", {"method": "GET", "path": f"/users/{from_id}"}, meli_user_id=cid)
+    if res.get("status") == 200:
+        apelido = (res.get("data") or {}).get("nickname", "") or ""
+    _nick_cache[from_id] = apelido
+    return apelido
+
+
 # ── Claude AI ──────────────────────────────────────────────────
 def chamar_claude(system, user_msg):
     headers = {
@@ -207,7 +250,7 @@ def enviar_email(assunto, corpo_html):
 
 
 def enviar_relatorio():
-    agora = datetime.now()
+    agora = agora_br()
     linhas = ""
     for c in CONTAS_ML:
         s = stats[c["id"]]
@@ -276,10 +319,22 @@ def processar_perguntas(conta):
             log.warning(f"[{nome}] ⏭️  Deixada para você | {titulo[:40]}")
             stats[cid]["perguntas_ignoradas"] += 1
         else:
+            # Saudação só na 1ª resposta a esse cliente nesse anúncio (evita repetir no bate-papo)
+            from_id = (q.get("from") or {}).get("id")
+            chave = f"{cid}:{q.get('item_id')}:{from_id}"
+            if chave not in _ja_saudados:
+                saud = saudacao_do_horario()
+                apelido = buscar_apelido(cid, from_id)
+                if apelido:
+                    resposta = f"Olá {apelido}, {saud}! {resposta}"
+                else:
+                    resposta = f"{saud.capitalize()}! {resposta}"
+
             res2 = mac_call("answer_question", {"question_id": q["id"], "text": resposta}, meli_user_id=cid)
             if res2.get("status") == 200:
                 log.info(f'[{nome}] ✅ Respondida: "{resposta[:50]}"')
                 stats[cid]["perguntas_respondidas"] += 1
+                _ja_saudados.add(chave)
             else:
                 log.error(f"[{nome}] ❌ Falha ao responder {q['id']}")
 
@@ -368,7 +423,7 @@ def processar_promocoes(conta):
         meu_desc  = round(desconto - copart_ml, 2)
 
         # Verifica horário comercial (seg-sex 08h-18h) para regras KERS/preço
-        agora_local = datetime.now()
+        agora_local = agora_br()
         horario_comercial = (agora_local.weekday() < 5 and 8 <= agora_local.hour < 18)
 
         # Promoção FLEXÍVEL — participa com desconto mínimo (6%)
@@ -437,7 +492,7 @@ def main():
 
     ciclo = 0
     while True:
-        agora = datetime.now()
+        agora = agora_br()
         try:
             # Perguntas — todas as contas a cada ciclo
             for conta in CONTAS_ML:
