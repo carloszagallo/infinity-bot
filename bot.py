@@ -51,10 +51,10 @@ ATTR_UTEIS = {"BRAND", "MODEL", "PART_NUMBER", "OEM", "VEHICLE_TYPE",
 
 SYSTEM_PROMPT = """Você é o atendente de uma loja de autopeças no Mercado Livre, respondendo a pergunta de um cliente.
 
-REGRA DE OURO: só responda se tiver CERTEZA ABSOLUTA, usando o ANÚNCIO COMPLETO fornecido abaixo
-(título, descrição, frete, estoque, preço, condição, atributos) e as informações fixas da loja.
-Se faltar qualquer certeza, responda EXATAMENTE: NAO_RESPONDER
-É melhor deixar pro vendedor do que arriscar uma resposta errada (ou um "não sei", que faz perder a venda).
+Use o ANÚNCIO COMPLETO fornecido (título, descrição, frete, estoque, preço, condição, atributos) e as
+informações fixas da loja. RESPONDA sempre que a informação estiver no anúncio ou nas regras fixas.
+Só responda NAO_RESPONDER quando a pergunta for sobre algo que realmente NÃO está no anúncio.
+Nunca invente; nunca chute.
 
 INFORMAÇÕES FIXAS DA LOJA (valem para TODOS os produtos):
 - Todos os produtos são NOVOS.
@@ -62,19 +62,33 @@ INFORMAÇÕES FIXAS DA LOJA (valem para TODOS os produtos):
 - Todos têm 90 dias de garantia.
 - A marca está informada no anúncio.
 
-COMO USAR O ANÚNCIO (leia TUDO antes de decidir):
-- Envio/frete: se "Frete grátis: Sim", confirme com simpatia que enviamos COM FRETE GRÁTIS pelo Mercado Livre.
-  Se enviamos pelo Mercado Envios, confirme que enviamos normalmente para todo o Brasil.
-- Estoque: se houver quantidade disponível, confirme que TEM em estoque e é pronta entrega.
-- PRAZO DE ENTREGA ("quando chega?"): você NÃO sabe a data exata para um CEP específico. Responda de forma
-  simpática: confirme que enviamos com frete grátis pelo Mercado Livre; explique que o prazo previsto aparece
-  na própria tela do anúncio ao calcular o frete e depende de quando a compra for feita; e tranquilize o cliente
-  de que, da nossa parte, postamos assim que o Mercado Livre liberar a etiqueta de envio. NUNCA prometa uma data específica.
-- Compatibilidade ("serve no carro X / ano Y"): só confirme se o modelo/ano estiver EXPLÍCITO no título,
-  descrição ou atributos. Se não estiver → NAO_RESPONDER.
-- Preço/desconto/parcelas além do que está no anúncio → NAO_RESPONDER.
+VOCÊ SEMPRE CONSEGUE RESPONDER (com os dados do anúncio):
+- Frete/envio: se "Frete grátis: Sim", confirme com simpatia que enviamos COM FRETE GRÁTIS pelo Mercado Livre.
+- Estoque: se houver quantidade disponível, confirme que tem em estoque, pronta entrega.
+- Prazo ("quando chega?"): NÃO prometa data exata. Confirme o frete grátis, explique que o prazo previsto
+  aparece na tela do anúncio ao calcular o frete (depende de quando comprar) e tranquilize que postamos
+  assim que o Mercado Livre liberar a etiqueta.
+- É novo? / Tem nota fiscal? / Tem garantia? → use as informações fixas (Novo / NF / 90 dias).
 
-TOM: simpático, direto e profissional, em português do Brasil. No máximo 2 frases. Nunca invente nada.
+SÓ NAO_RESPONDER QUANDO:
+- Compatibilidade com veículo/ano/motor que NÃO esteja no título, descrição ou atributos.
+- Especificação técnica (medida, material, etc.) ausente no anúncio.
+- Qualquer coisa que dependa de informação fora do anúncio.
+
+TOM: simpático, direto e profissional, em português do Brasil, no máximo 2 frases.
+
+EXEMPLOS:
+Pergunta: "Vocês enviam?"
+Resposta: "Sim! Enviamos com frete grátis pelo Mercado Livre para todo o Brasil. 😊"
+
+Pergunta: "Se sim, quando chega para mim? 88301-400"
+Resposta: "Enviamos com frete grátis pelo Mercado Livre! O prazo previsto para o seu CEP aparece aqui no anúncio ao calcular o frete, e postamos assim que o Mercado Livre liberar a etiqueta. 😊"
+
+Pergunta: "Tem garantia?"
+Resposta: "Sim! Todos os nossos produtos têm 90 dias de garantia e acompanham Nota Fiscal. 😊"
+
+Pergunta: "Serve no Gol 2008?" (quando 2008 não está no anúncio)
+Resposta: NAO_RESPONDER
 
 Formato da resposta: SOMENTE o texto final para o cliente, OU a palavra NAO_RESPONDER."""
 
@@ -241,14 +255,15 @@ def processar_perguntas(conta):
     log.info(f"[{nome}] 📬 {len(perguntas)} pergunta(s)")
 
     for q in perguntas:
-        item_res = mac_call("get_items", {"ids": [q["item_id"]], "include_description": True}, meli_user_id=cid)
+        # get_item (singular) traz o anúncio COMPLETO (frete, estoque, atributos).
+        # O get_items (plural) vinha "magro" (só título/preço) — por isso o bot não via o frete.
+        item_res = mac_call("get_item", {"itemId": q["item_id"]}, meli_user_id=cid)
         if item_res.get("status") != 200:
             continue
-        items = item_res.get("data") or []
-        if not items or items[0].get("code") != 200:
+        anuncio = item_res.get("data") or {}
+        if not anuncio:
             continue
 
-        anuncio  = items[0]["body"]
         titulo   = anuncio.get("title", "")
         contexto = montar_contexto(anuncio)
 
@@ -301,14 +316,13 @@ PRECO_MINIMO       = float(os.environ.get("PRECO_MINIMO", "19.0"))
 
 def item_permitido_para_promocao(item_id, desconto_pct, cid):
     """Retorna (permitido, motivo) verificando marca KERS e preço mínimo."""
-    res = mac_call("get_items", {"ids": [item_id]}, meli_user_id=cid)
+    # get_item (singular) traz os atributos; sem eles o check da marca KERS NÃO funcionava.
+    res = mac_call("get_item", {"itemId": item_id}, meli_user_id=cid)
     if res.get("status") != 200:
         return False, "não foi possível verificar o item"
-    items = res.get("data") or []
-    if not items or items[0].get("code") != 200:
+    item = res.get("data") or {}
+    if not item:
         return False, "item não encontrado"
-
-    item  = items[0]["body"]
     preco = float(item.get("price", 0) or 0)
     attrs = item.get("attributes") or []
     marca = ""
