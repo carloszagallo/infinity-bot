@@ -57,6 +57,8 @@ def saudacao_do_horario():
 # Apelidos já buscados e clientes já saudados NESTA sessão (saudação só na 1ª resposta)
 _nick_cache = {}
 _ja_saudados = set()
+# Perguntas que a IA já avaliou e não soube responder — não re-loga nem re-consulta toda volta
+_sem_resposta = set()
 
 # ── Stats por conta ────────────────────────────────────────────
 def novo_stats():
@@ -330,6 +332,11 @@ def processar_perguntas(conta):
     if not perguntas:
         return
 
+    # Tira as que a IA já avaliou e não soube responder — não re-loga nem re-gasta crédito toda volta
+    perguntas = [q for q in perguntas if q["id"] not in _sem_resposta]
+    if not perguntas:
+        return
+
     log.info(f"[{nome}] 📬 {len(perguntas)} pergunta(s)")
 
     for q in perguntas:
@@ -351,7 +358,9 @@ def processar_perguntas(conta):
 
         # Trava: NAO_RESPONDER explícito OU qualquer incerteza em prosa → não publica
         if deve_pular(resposta):
-            log.warning(f"[{nome}] ⏭️  Deixada para você | {titulo[:40]}")
+            # Não soube responder: marca e segue calado (sem sinalizar/re-consultar toda volta).
+            # A estratégia dos "não respondidos" você define depois.
+            _sem_resposta.add(q["id"])
             stats[cid]["perguntas_ignoradas"] += 1
         else:
             # Saudação só na 1ª resposta a esse cliente nesse anúncio (evita repetir no bate-papo)
@@ -450,119 +459,4 @@ def processar_promocoes(conta):
         nome_p   = promo.get("name", promo_id)
 
         if status == "started":
-            log.info(f"[{nome}] ✅ Já ativa: {nome_p}")
-            continue
-
-        desconto  = float(promo.get("discount_percentage", 0) or 0)
-        copart_ml = float(promo.get("marketplace_discount_percentage", 0) or 0)
-        meu_desc  = round(desconto - copart_ml, 2)
-
-        # Verifica horário comercial (seg-sex 08h-18h) para regras KERS/preço
-        agora_local = agora_br()
-        horario_comercial = (agora_local.weekday() < 5 and 8 <= agora_local.hour < 18)
-
-        # Promoção FLEXÍVEL — participa com desconto mínimo (6%)
-        sub_type = promo.get("sub_type", "")
-        if sub_type == "FLEXIBLE_PERCENTAGE":
-            desconto  = 6.0
-            copart_ml = float(promo.get("marketplace_discount_percentage", 0) or 0)
-            meu_desc  = round(desconto - copart_ml, 2)
-            log.info(f"[{nome}] 🔧 Promoção flexível — usando desconto mínimo 6%: {nome_p}")
-
-        # Verifica desconto máximo
-        if meu_desc > MAX_DESCONTO_MEU:
-            log.warning(f"[{nome}] ❌ Ignorada ({meu_desc}% > {MAX_DESCONTO_MEU}%): {nome_p}")
-            stats[cid]["promocoes_ignoradas"] += 1
-            continue
-
-        # Busca itens da promoção para verificar KERS e preço mínimo
-        bloqueada = False
-        try:
-            res_items = mac_call("ml_promotion_items", {"promotion_id": promo_id, "limit": 10}, meli_user_id=cid)
-            items_promo = []
-            if res_items.get("status") == 200:
-                items_promo = (res_items.get("data") or {}).get("results", [])
-
-            for it in items_promo[:5]:  # verifica até 5 itens por promoção
-                item_id = it.get("item_id") or it.get("id")
-                if not item_id:
-                    continue
-                permitido, motivo = item_permitido_para_promocao(item_id, desconto, cid)
-                if not permitido:
-                    log.warning(f"[{nome}] 🚫 Bloqueada — {motivo}: {nome_p}")
-                    stats[cid]["promocoes_ignoradas"] += 1
-                    bloqueada = True
-                    break
-        except Exception as e:
-            log.warning(f"[{nome}] ⚠️  Erro ao verificar itens de {nome_p}: {e}")
-
-        if bloqueada:
-            continue
-
-        # Tudo ok — ativa a promoção
-        params_ativacao = {"promotion_id": promo_id, "status": "started"}
-        if sub_type == "FLEXIBLE_PERCENTAGE":
-            params_ativacao["discount_percentage"] = desconto
-        res2 = mac_call("ml_update_promotion", params_ativacao, meli_user_id=cid)
-        if res2.get("status") in [200, 201]:
-            log.info(f"[{nome}] 🏷️  Ativada: {nome_p} ({meu_desc}%)")
-            stats[cid]["promocoes_ativadas"] += 1
-        else:
-            log.warning(f"[{nome}] ⚠️  Não ativou: {nome_p} — {res2.get('error','')}")
-
-
-# ── LOOP PRINCIPAL ─────────────────────────────────────────────
-def main():
-    global ultima_promo, ultimo_rel_manha, ultimo_rel_tarde
-
-    log.info("🚀 INFINITY BOT iniciado!")
-    log.info(f"   Contas ML   : {[c['nome'] for c in CONTAS_ML]}")
-    log.info(f"   Intervalo   : {INTERVALO_SEG}s")
-    log.info(f"   Desc. máx.  : {MAX_DESCONTO_MEU}%")
-
-    if not MAC_API_KEY:
-        log.error("❌ MAC_API_KEY não configurada!"); return
-    if not CLAUDE_API_KEY:
-        log.error("❌ CLAUDE_API_KEY não configurada!"); return
-
-    ciclo = 0
-    while True:
-        agora = agora_br()
-        try:
-            # Perguntas — todas as contas a cada ciclo
-            for conta in CONTAS_ML:
-                processar_perguntas(conta)
-
-            # Avaliações — a cada 10 ciclos (~5 min)
-            if ciclo % 10 == 0:
-                for conta in CONTAS_ML:
-                    processar_avaliacoes(conta)
-
-            # Promoções — a cada 6h
-            if ultima_promo is None or (agora - ultima_promo) >= timedelta(hours=6):
-                for conta in CONTAS_ML:
-                    processar_promocoes(conta)
-                ultima_promo = agora
-
-            # Relatório 07:00
-            if agora.hour == 7 and agora.minute < 1:
-                if ultimo_rel_manha is None or ultimo_rel_manha.date() < agora.date():
-                    enviar_relatorio()
-                    ultimo_rel_manha = agora
-
-            # Relatório 19:00
-            if agora.hour == 19 and agora.minute < 1:
-                if ultimo_rel_tarde is None or ultimo_rel_tarde.date() < agora.date():
-                    enviar_relatorio()
-                    ultimo_rel_tarde = agora
-
-        except Exception as e:
-            log.error(f"Erro inesperado: {e}")
-
-        ciclo += 1
-        log.info(f"⏳ Aguardando {INTERVALO_SEG}s...")
-        time.sleep(INTERVALO_SEG)
-
-
-if __name__ == "__main__":
-    main()
+            log.info(f"[{no
