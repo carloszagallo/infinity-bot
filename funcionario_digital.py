@@ -20,6 +20,7 @@ SEGURANÇA: APLICAR=false (DRY-RUN) por padrão; só escreve com APLICAR=true.
 Tudo por merge (PUT) — não apaga nada, não toca em compatibilidade nem foto.
 """
 import os, time, logging, requests
+from urllib.parse import quote
 
 MAC_API_KEY = os.environ.get("MAC_API_KEY", "")
 MAC_BASE_URL = "https://mcp.tiops.com.br/marketplace"
@@ -63,29 +64,56 @@ def mac(action, params=None, meli_user_id=None):
 
 
 def listar(cid):
-    sort = "start_time_desc" if MODO == "incremental" else "stop_time_asc"
     cap = MAX_ITENS if MAX_ITENS else (500 if MODO == "incremental" else 0)
-    ids, offset = [], 0
+    ids = []
+
+    if MODO == "incremental":
+        # Mais novos primeiro (offset). A ML limita offset a ~1000 — ok pro incremental.
+        offset = 0
+        while True:
+            q = ["sort=start_time_desc", "limit=50", f"offset={offset}"]
+            if STATUS_ALVO and STATUS_ALVO.lower() != "all":
+                q.append(f"status={STATUS_ALVO}")
+            if SUB_STATUS:
+                q.append(f"sub_status={SUB_STATUS}")
+            p = f"/users/{cid}/items/search?" + "&".join(q)
+            res = mac("raw", {"method": "GET", "path": p}, meli_user_id=cid)
+            if res.get("status") != 200:
+                break
+            lote = (res.get("data") or {}).get("results", [])
+            if not lote:
+                break
+            ids += lote
+            offset += 50
+            if cap and len(ids) >= cap:
+                return ids[:cap]
+            if offset >= 1000:   # teto duro de offset da ML
+                break
+            time.sleep(PAUSA)
+        return ids
+
+    # MODO full: search_type=scan (scroll) FURA o teto de 1000 e pega TODOS os anúncios.
+    scroll_id = None
     while True:
-        q = [f"sort={sort}", "limit=50", f"offset={offset}"]
+        q = ["search_type=scan", "limit=100"]
         if STATUS_ALVO and STATUS_ALVO.lower() != "all":
             q.append(f"status={STATUS_ALVO}")
         if SUB_STATUS:
             q.append(f"sub_status={SUB_STATUS}")
+        if scroll_id:
+            q.append(f"scroll_id={quote(scroll_id, safe='')}")
         p = f"/users/{cid}/items/search?" + "&".join(q)
         res = mac("raw", {"method": "GET", "path": p}, meli_user_id=cid)
         if res.get("status") != 200:
             break
-        lote = (res.get("data") or {}).get("results", [])
+        data = res.get("data") or {}
+        scroll_id = data.get("scroll_id") or scroll_id
+        lote = data.get("results", [])
         if not lote:
             break
         ids += lote
-        total = ((res.get("data") or {}).get("paging") or {}).get("total", 0)
-        offset += 50
         if cap and len(ids) >= cap:
             return ids[:cap]
-        if offset >= total:
-            break
         time.sleep(PAUSA)
     return ids
 
