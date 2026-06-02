@@ -25,6 +25,7 @@ PAUSA_PAGINA     = float(os.environ.get("PAUSA_PAGINA", "0.4"))
 PAUSA_UPDATE     = float(os.environ.get("PAUSA_UPDATE", "0.5"))
 MAX_ERROS_PAGINA = int(os.environ.get("MAX_ERROS_PAGINA", "5"))   # erros seguidos antes de desistir da conta
 MAX_ANUNCIOS     = int(os.environ.get("MAX_ANUNCIOS", "25000"))   # teto de segurança por conta
+INTERVALO_HORAS  = float(os.environ.get("INTERVALO_HORAS", "24"))  # repete a cada X horas (24 = todo dia; bota 6 no catch-up)
 
 # ── Memória persistente (Railway Volume em /data) ──────────────
 CHECKPOINT_DIR  = os.environ.get("CHECKPOINT_DIR", "/data")
@@ -395,7 +396,7 @@ def rodar():
     enviar_relatorio(stats_contas)
     if completou_tudo:
         limpar_checkpoint()
-    log.info("📋 Rodada concluída! Aguardando próxima semana...")
+    log.info("📋 Rodada concluída!")
 
 
 # ── MAIN ───────────────────────────────────────────────────────
@@ -412,16 +413,12 @@ def main():
         log.warning(f"⚠️ Sem persistência em {CHECKPOINT_DIR} ({e}). "
                     f"Sem o Volume montado, a memória não sobrevive a restart.")
 
-    if RUN_ON_START:
-        rodar()
-
-    # Roda uma vez por semana (domingo 03:00)
+    # Roda agora ao subir e repete a cada INTERVALO_HORAS (padrão 24h = todo dia).
+    # Quando uma passada parar de preencher coisa nova, é sinal de que zerou o que dava pra zerar.
     while True:
-        agora = datetime.now()
-        if agora.weekday() == 6 and agora.hour == 3 and agora.minute < 1:
-            rodar()
-            time.sleep(120)   # passa da janela do minuto
-        time.sleep(30)
+        rodar()
+        log.info(f"⏳ Próxima rodada em {INTERVALO_HORAS:.0f}h...")
+        time.sleep(max(60, INTERVALO_HORAS * 3600))
 
 
 if __name__ == "__main__":
