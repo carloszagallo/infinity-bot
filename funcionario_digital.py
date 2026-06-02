@@ -15,6 +15,12 @@ AGENDADOR:
   INTERVALO_DIAS=0  -> roda uma vez e encerra.
   INTERVALO_DIAS=2  -> roda, dorme 2 dias, repete (fica ligado).
 
+MEMÓRIA (NOVO):
+  Anota os itens já tratados num arquivo em CHECKPOINT_DIR (padrão /data).
+  Se reiniciar no meio da passada, RETOMA de onde parou em vez de recomeçar do zero.
+  Ao terminar a passada completa, limpa a memória (a próxima varredura começa fresca).
+  ⚠️ Precisa de um Volume do Railway montado em /data pra sobreviver a redeploys.
+
 SEGURANÇA: APLICAR=false (DRY-RUN) por padrão; só escreve com APLICAR=true.
 É idempotente: só mexe onde realmente há correção; re-passar num anúncio já certo não muda nada.
 Tudo por merge (PUT) — não apaga nada, não toca em compatibilidade nem foto.
@@ -33,6 +39,11 @@ MAX_ITENS      = int(os.environ.get("MAX_ITENS", "0"))            # 0 = todos (f
 INTERVALO_DIAS = float(os.environ.get("INTERVALO_DIAS", "0"))     # 0 = roda 1x
 PAUSA          = float(os.environ.get("PAUSA", "0.25"))
 
+# 🧠 MEMÓRIA — checkpoint que sobrevive a reinício (se houver Volume em /data)
+CHECKPOINT_DIR  = os.environ.get("CHECKPOINT_DIR", "/data")
+CHECKPOINT_FILE = os.path.join(CHECKPOINT_DIR, "faxineiro_checkpoint.txt")
+_aviso_volume = False
+
 INMETRO_NA   = "33966573"
 ORIGEM_CHINA = "96381"
 GENUINAS = ["original", "genuin", "bosch", "denso", "keihin", "ngk", "valeo",
@@ -48,6 +59,37 @@ CONTAS_ML = [
 logging.basicConfig(level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger("FuncDigital")
+
+
+# 🧠 ───────── MEMÓRIA (checkpoint) ─────────
+def carregar_checkpoint():
+    """Lê os itens já tratados nesta passada. Vazio se não existir."""
+    try:
+        with open(CHECKPOINT_FILE, "r", encoding="utf-8") as f:
+            return set(l.strip() for l in f if l.strip())
+    except Exception:
+        return set()
+
+
+def marcar_feito(chave):
+    """Anexa 1 item à memória (append — barato). Avisa 1x se não der pra gravar."""
+    global _aviso_volume
+    try:
+        with open(CHECKPOINT_FILE, "a", encoding="utf-8") as f:
+            f.write(chave + "\n")
+    except Exception as e:
+        if not _aviso_volume:
+            log.warning(f"🧠 Sem persistência em {CHECKPOINT_FILE} ({e}). "
+                        f"A memória só sobrevive a reinício se houver um Volume montado em {CHECKPOINT_DIR}.")
+            _aviso_volume = True
+
+
+def limpar_checkpoint():
+    """Apaga a memória ao terminar a passada completa (a próxima começa fresca)."""
+    try:
+        os.remove(CHECKPOINT_FILE)
+    except Exception:
+        pass
 
 
 def mac(action, params=None, meli_user_id=None):
@@ -215,15 +257,25 @@ def run_once():
     modo_txt = "APLICANDO (escrita real)" if APLICAR else "DRY-RUN (só simula)"
     alvo = f"{STATUS_ALVO}" + (f"/{SUB_STATUS}" if SUB_STATUS else "")
     log.info(f"🤖 Funcionário Digital — modo={MODO} | alvo={alvo} | {modo_txt}")
+
+    done = carregar_checkpoint()                       # 🧠 retoma de onde parou
+    if done:
+        log.info(f"🧠 Memória: retomando — {len(done)} itens já tratados serão pulados.")
+
     tot = {"itens": 0, "inmetro": 0, "origem": 0, "codigos": 0, "garantia": 0,
-           "titulo_alerta": 0, "escritos": 0, "erros": 0}
+           "titulo_alerta": 0, "escritos": 0, "erros": 0, "pulados": 0}
     for c in CONTAS_ML:
         ids = listar(c["id"])
         log.info(f"[{c['nome']}] {len(ids)} anúncios ({STATUS_ALVO}, {MODO}).")
         for i, iid in enumerate(ids, 1):
+            chave = f"{c['id']}:{iid}"
+            if chave in done:                          # 🧠 já tratado nesta passada → pula
+                tot["pulados"] += 1
+                continue
             item = get_item(c["id"], iid)
             if not item:
-                tot["erros"] += 1; continue
+                tot["erros"] += 1
+                continue                               # não marca: tenta de novo num próximo resume
             tot["itens"] += 1
             attrs, sale_terms, alertas = planeja(item)
             for a in attrs:
@@ -242,15 +294,21 @@ def run_once():
                     else:
                         tot["erros"] += 1
                         log.warning(f"    falha: {(r or {}).get('data')}")
+            done.add(chave); marcar_feito(chave)       # 🧠 marca como tratado (sobrevive a reinício)
             if i % 50 == 0:
                 log.info(f"[{c['nome']}] {i}/{len(ids)}...")
             time.sleep(PAUSA)
+    limpar_checkpoint()                                # 🧠 passada completa → zera a memória
     log.info(f"🤖 Passada concluída. {tot}")
 
 
 def main():
     if not MAC_API_KEY:
         log.error("MAC_API_KEY ausente"); return
+    try:
+        os.makedirs(CHECKPOINT_DIR, exist_ok=True)     # 🧠 garante a pasta da memória
+    except Exception:
+        pass
     run_once()
     while INTERVALO_DIAS > 0:
         log.info(f"😴 Dormindo {INTERVALO_DIAS} dia(s) até a próxima varredura...")
