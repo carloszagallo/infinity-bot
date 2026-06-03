@@ -195,7 +195,14 @@ def analisar_com_claude(titulo, faltantes):
         if data.get("content"):
             texto = data["content"][0]["text"].strip()
             texto = texto.replace("```json", "").replace("```", "").strip()
-            return json.loads(texto).get("atributos", [])
+            ini = texto.find("{")
+            if ini > 0:
+                texto = texto[ini:]
+            try:
+                return json.loads(texto).get("atributos", [])
+            except json.JSONDecodeError:
+                obj, _ = json.JSONDecoder().raw_decode(texto)  # ignora texto extra após o JSON
+                return obj.get("atributos", [])
     except Exception as e:
         log.error(f"Erro Claude: {e}")
     return []
@@ -331,7 +338,7 @@ def processar_conta(conta, feitos):
                     marcar_feito(chave)
                     continue
 
-                res2 = mac_call("update_item", {"item_id": item_id, "attributes": novos}, meli_user_id=cid)
+                res2 = mac_call("raw", {"method": "PUT", "path": f"/items/{item_id}", "body": {"attributes": novos}}, meli_user_id=cid)
                 if res2.get("status") in (200, 201):
                     log.info(f"[{nome}] ✅ {item_id} | {len(novos)} attr | {titulo}")
                     stats["preenchidos"] += len(novos)
@@ -423,4 +430,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
