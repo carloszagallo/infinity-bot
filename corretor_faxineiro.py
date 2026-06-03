@@ -37,6 +37,7 @@ MAC_BASE_URL = "https://mcp.tiops.com.br/marketplace"
 APLICAR        = os.environ.get("APLICAR", "false").lower() == "true"
 COMPAT_APLICAR = os.environ.get("COMPAT_APLICAR", "false").lower() == "true"   # escrita de compat
 RELATORIO      = os.environ.get("RELATORIO", "true").lower() == "true"         # envia Telegram/email
+REPOR_JA       = os.environ.get("REPOR_JA", "false").lower() == "true"         # liga a passada (pesada) de pedidos p/ 'repor já'
 MODO           = os.environ.get("MODO", "full").lower()          # full | incremental
 STATUS_ALVO    = os.environ.get("STATUS_ALVO", "active")          # active | paused | all
 SUB_STATUS     = os.environ.get("SUB_STATUS", "").strip()
@@ -308,8 +309,9 @@ def copiar_compatibilidade(cid, alvo, sku, item_alvo):
 # ───────── RELATÓRIO ─────────
 def velocidade_vendas(cid):
     """Vendas/dia por item nos últimos SALES_WINDOW dias (para 'repor já')."""
-    from datetime import datetime, timedelta
-    desde = (datetime.utcnow() - timedelta(days=SALES_WINDOW)).strftime("%Y-%m-%dT00:00:00.000-00:00")
+    from datetime import datetime, timedelta, timezone
+    desde = (datetime.now(timezone.utc) - timedelta(days=SALES_WINDOW)).strftime("%Y-%m-%dT00:00:00.000-00:00")
+    log.info(f"[{cid}] calculando giro de vendas ({SALES_WINDOW} dias)... (pode demorar)")
     sold, offset = {}, 0
     while offset < 4000:
         p = (f"/orders/search?seller={cid}&order.status=paid"
@@ -325,6 +327,7 @@ def velocidade_vendas(cid):
         offset += 50
         if offset >= data.get("paging", {}).get("total", 0) or not results: break
         time.sleep(PAUSA)
+    log.info(f"[{cid}] giro calculado: {len(sold)} itens com venda no período.")
     return {k: v / SALES_WINDOW for k, v in sold.items()}
 
 def foto_px(item):
@@ -417,7 +420,8 @@ def run_once():
     buckets = {k: [] for k in HEADERS}
 
     for c in CONTAS_ML:
-        vel = velocidade_vendas(c["id"]) if RELATORIO else {}
+        log.info(f"[{c['nome']}] iniciando varredura...")
+        vel = velocidade_vendas(c["id"]) if (RELATORIO and REPOR_JA) else {}
         ids = listar(c["id"])
         log.info(f"[{c['nome']}] {len(ids)} anúncios ({STATUS_ALVO}, {MODO}).")
         for i, iid in enumerate(ids, 1):
