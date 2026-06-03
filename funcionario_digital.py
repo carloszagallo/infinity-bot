@@ -1,53 +1,35 @@
-"""
-Funcionário Digital — Infinity Bot
-Correções SEGURAS e determinísticas (sem IA, sem adivinhação), por anúncio:
-  1) GARANTIA  -> "90 dias" PRESERVANDO o tipo (fábrica/vendedor)
-  2) INMETRO   -> "N/A" (33966573) onde está vazio/inválido (respeita número real)
-  3) ORIGEM    -> "China" (96381) onde está vazia
-  4) OEM x Nº DE PEÇA -> normaliza pra VÍRGULA e sincroniza (copia se um está vazio)
-  5) TÍTULO    -> só SINALIZA palavra de peça genuína (não reescreve)
+import os
+import time
+import json
+import logging
+import requests
+from datetime import datetime
 
-MODOS:
-  MODO=full         -> varre TODOS (status escolhido). Use na 1ª passada.
-  MODO=incremental  -> varre só os MAIS NOVOS (cap MAX_ITENS, padrão 500). Use no recorrente.
+# ── Configurações ──────────────────────────────────────────────
+MAC_API_KEY    = os.environ.get("MAC_API_KEY", "")
+CLAUDE_API_KEY = os.environ.get("CLAUDE_API_KEY", "")
 
-AGENDADOR:
-  INTERVALO_DIAS=0  -> roda uma vez e encerra.
-  INTERVALO_DIAS=2  -> roda, dorme 2 dias, repete (fica ligado).
+# Relatório via Telegram (SMTP não funciona no Railway — porta bloqueada).
+# Reaproveita o MESMO token/chat do Atendente.
+TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-MEMÓRIA (NOVO):
-  Anota os itens já tratados num arquivo em CHECKPOINT_DIR (padrão /data).
-  Se reiniciar no meio da passada, RETOMA de onde parou em vez de recomeçar do zero.
-  Ao terminar a passada completa, limpa a memória (a próxima varredura começa fresca).
-  ⚠️ Precisa de um Volume do Railway montado em /data pra sobreviver a redeploys.
+MAC_BASE_URL  = "https://mcp.tiops.com.br/marketplace"
+HEALTH_MINIMO = float(os.environ.get("HEALTH_MINIMO", "0.80"))
+LOTE_SIZE     = int(os.environ.get("LOTE_SIZE", "50"))
 
-SEGURANÇA: APLICAR=false (DRY-RUN) por padrão; só escreve com APLICAR=true.
-É idempotente: só mexe onde realmente há correção; re-passar num anúncio já certo não muda nada.
-Tudo por merge (PUT) — não apaga nada, não toca em compatibilidade nem foto.
-"""
-import os, time, logging, requests
-from urllib.parse import quote
+# Segurança e robustez
+DRY_RUN          = os.environ.get("DRY_RUN", "true").lower() == "true"      # true = só simula, não grava
+RUN_ON_START     = os.environ.get("RUN_ON_START", "false").lower() == "true"  # roda uma vez ao subir
+PAUSA_PAGINA     = float(os.environ.get("PAUSA_PAGINA", "0.4"))
+PAUSA_UPDATE     = float(os.environ.get("PAUSA_UPDATE", "0.5"))
+MAX_ERROS_PAGINA = int(os.environ.get("MAX_ERROS_PAGINA", "5"))   # erros seguidos antes de desistir da conta
+MAX_ANUNCIOS     = int(os.environ.get("MAX_ANUNCIOS", "25000"))   # teto de segurança por conta
+INTERVALO_HORAS  = float(os.environ.get("INTERVALO_HORAS", "24"))  # repete a cada X horas (24 = todo dia; bota 6 no catch-up)
 
-MAC_API_KEY = os.environ.get("MAC_API_KEY", "")
-MAC_BASE_URL = "https://mcp.tiops.com.br/marketplace"
-
-APLICAR        = os.environ.get("APLICAR", "false").lower() == "true"
-MODO           = os.environ.get("MODO", "full").lower()          # full | incremental
-STATUS_ALVO    = os.environ.get("STATUS_ALVO", "active")          # active | paused | all
-SUB_STATUS     = os.environ.get("SUB_STATUS", "").strip()         # ex.: waiting_for_patch (vazio = todos)
-MAX_ITENS      = int(os.environ.get("MAX_ITENS", "0"))            # 0 = todos (full) / 500 (incremental)
-INTERVALO_DIAS = float(os.environ.get("INTERVALO_DIAS", "0"))     # 0 = roda 1x
-PAUSA          = float(os.environ.get("PAUSA", "0.25"))
-
-# 🧠 MEMÓRIA — checkpoint que sobrevive a reinício (se houver Volume em /data)
+# ── Memória persistente (Railway Volume em /data) ──────────────
 CHECKPOINT_DIR  = os.environ.get("CHECKPOINT_DIR", "/data")
-CHECKPOINT_FILE = os.path.join(CHECKPOINT_DIR, "faxineiro_checkpoint.txt")
-_aviso_volume = False
-
-INMETRO_NA   = "33966573"
-ORIGEM_CHINA = "96381"
-GENUINAS = ["original", "genuin", "bosch", "denso", "keihin", "ngk", "valeo",
-            "mahle", "sachs", "skf", "gates", "delphi", "magneti"]
+CHECKPOINT_FILE = os.path.join(CHECKPOINT_DIR, "fichario_checkpoint.txt")
 
 CONTAS_ML = [
     {"id": 60771984,  "nome": "INFINITY AUTOPARTS"},
@@ -56,264 +38,394 @@ CONTAS_ML = [
     {"id": 1994875400,"nome": "DESTINYAUTOPARTS"},
 ]
 
-logging.basicConfig(level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
-log = logging.getLogger("FuncDigital")
+# Atributos que vale a pena tentar completar (foco na ficha técnica de autopeça).
+# O código só mexe nos que NÃO são read_only / hidden na categoria.
+CAMPOS_ALVO = {"BRAND", "MODEL", "PART_NUMBER", "VEHICLE_TYPE", "ORIGIN",
+               "OEM", "IS_KIT", "ITEM_CONDITION", "NUMBER_OF_FANS"}
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger("FichaTecnica")
+
+SYSTEM_PROMPT = """Você é um especialista em autopeças preenchendo atributos de anúncios do Mercado Livre.
+Recebe o TÍTULO do anúncio e uma lista de ATRIBUTOS FALTANTES (cada um com seus valores permitidos, quando houver).
+Preencha SOMENTE os atributos que conseguir deduzir com CERTEZA ABSOLUTA a partir do título.
+
+Regras ESTRITAS:
+1. Na dúvida, NÃO preencha — é melhor deixar de fora do que errar.
+2. Quando o atributo tiver lista de valores permitidos, use EXATAMENTE um desses nomes.
+3. Condição do item: sempre "Novo" (todos os nossos produtos são novos).
+4. NUNCA invente informação que não esteja no título.
+
+Responda APENAS em JSON, sem texto fora dele:
+{"atributos": [{"id": "ATRIBUTO_ID", "value_name": "VALOR"}]}
+Se não tiver certeza de nenhum, responda: {"atributos": []}"""
 
 
-# 🧠 ───────── MEMÓRIA (checkpoint) ─────────
-def carregar_checkpoint():
-    """Lê os itens já tratados nesta passada. Vazio se não existir."""
+# ── MAC API ────────────────────────────────────────────────────
+def mac_call(action, params=None, meli_user_id=None):
+    payload = {"action": action, "params": params or {}}
+    if meli_user_id:
+        payload["meli_user_id"] = meli_user_id
+    headers = {"Content-Type": "application/json", "x-api-key": MAC_API_KEY}
     try:
-        with open(CHECKPOINT_FILE, "r", encoding="utf-8") as f:
-            return set(l.strip() for l in f if l.strip())
-    except Exception:
-        return set()
+        r = requests.post(MAC_BASE_URL, json=payload, headers=headers, timeout=40)
+        return r.json()
+    except Exception as e:
+        return {"status": 0, "error": f"exception: {e}"}
+
+
+# ── Telegram ───────────────────────────────────────────────────
+def tg_send(texto):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        log.warning("TELEGRAM_TOKEN/CHAT_ID não configurados — relatório não enviado. Resumo no log:")
+        log.info(texto.replace("<b>", "").replace("</b>", ""))
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    # Telegram limita ~4096 chars por mensagem
+    for i in range(0, len(texto), 3500):
+        pedaco = texto[i:i + 3500]
+        try:
+            r = requests.post(url, json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": pedaco,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            }, timeout=20)
+            if r.status_code != 200:
+                log.error(f"Erro Telegram ({r.status_code}): {r.text[:200]}")
+        except Exception as e:
+            log.error(f"Erro Telegram: {e}")
+
+
+# ── Memória / checkpoint ───────────────────────────────────────
+def carregar_checkpoint():
+    """Retorna o set de chaves 'cid:iid' já tratadas em passadas anteriores."""
+    try:
+        if os.path.exists(CHECKPOINT_FILE):
+            with open(CHECKPOINT_FILE, "r", encoding="utf-8") as f:
+                feitos = {ln.strip() for ln in f if ln.strip()}
+            log.info(f"🧠 Memória: retomando — {len(feitos)} itens já tratados serão pulados.")
+            return feitos
+    except Exception as e:
+        log.warning(f"Não consegui ler o checkpoint ({e}). Começando do zero nesta passada.")
+    return set()
 
 
 def marcar_feito(chave):
-    """Anexa 1 item à memória (append — barato). Avisa 1x se não der pra gravar."""
-    global _aviso_volume
+    """Acrescenta uma chave 'cid:iid' ao arquivo de memória (append, à prova de queda)."""
     try:
         with open(CHECKPOINT_FILE, "a", encoding="utf-8") as f:
             f.write(chave + "\n")
     except Exception as e:
-        if not _aviso_volume:
-            log.warning(f"🧠 Sem persistência em {CHECKPOINT_FILE} ({e}). "
-                        f"A memória só sobrevive a reinício se houver um Volume montado em {CHECKPOINT_DIR}.")
-            _aviso_volume = True
+        log.warning(f"Não consegui gravar no checkpoint ({e}).")
 
 
 def limpar_checkpoint():
-    """Apaga a memória ao terminar a passada completa (a próxima começa fresca)."""
+    """Zera a memória ao terminar uma passada completa nas 4 contas."""
     try:
-        os.remove(CHECKPOINT_FILE)
-    except Exception:
-        pass
-
-
-def mac(action, params=None, meli_user_id=None):
-    payload = {"action": action, "params": params or {}}
-    if meli_user_id:
-        payload["meli_user_id"] = meli_user_id
-    try:
-        r = requests.post(MAC_BASE_URL, json=payload,
-                          headers={"Content-Type": "application/json", "x-api-key": MAC_API_KEY},
-                          timeout=40)
-        return r.json()
+        if os.path.exists(CHECKPOINT_FILE):
+            os.remove(CHECKPOINT_FILE)
+            log.info("🧠 Passada completa concluída — memória limpa para a próxima rodada.")
     except Exception as e:
-        return {"status": 0, "error": str(e)}
+        log.warning(f"Não consegui limpar o checkpoint ({e}).")
 
 
-def listar(cid):
-    cap = MAX_ITENS if MAX_ITENS else (500 if MODO == "incremental" else 0)
-    ids = []
+# ── Atributos da categoria (com cache) ─────────────────────────
+_cache_categoria = {}
 
-    if MODO == "incremental":
-        # Mais novos primeiro (offset). A ML limita offset a ~1000 — ok pro incremental.
-        offset = 0
-        while True:
-            q = ["sort=start_time_desc", "limit=50", f"offset={offset}"]
-            if STATUS_ALVO and STATUS_ALVO.lower() != "all":
-                q.append(f"status={STATUS_ALVO}")
-            if SUB_STATUS:
-                q.append(f"sub_status={SUB_STATUS}")
-            p = f"/users/{cid}/items/search?" + "&".join(q)
-            res = mac("raw", {"method": "GET", "path": p}, meli_user_id=cid)
-            if res.get("status") != 200:
-                break
-            lote = (res.get("data") or {}).get("results", [])
-            if not lote:
-                break
-            ids += lote
-            offset += 50
-            if cap and len(ids) >= cap:
-                return ids[:cap]
-            if offset >= 1000:   # teto duro de offset da ML
-                break
-            time.sleep(PAUSA)
-        return ids
+def campos_da_categoria(category_id):
+    """Atributos PREENCHÍVEIS da categoria (sem read_only/hidden), com valores permitidos."""
+    if category_id in _cache_categoria:
+        return _cache_categoria[category_id]
 
-    # MODO full: search_type=scan (scroll) FURA o teto de 1000 e pega TODOS os anúncios.
-    scroll_id = None
-    while True:
-        q = ["search_type=scan", "limit=100"]
-        if STATUS_ALVO and STATUS_ALVO.lower() != "all":
-            q.append(f"status={STATUS_ALVO}")
-        if SUB_STATUS:
-            q.append(f"sub_status={SUB_STATUS}")
-        if scroll_id:
-            q.append(f"scroll_id={quote(scroll_id, safe='')}")
-        p = f"/users/{cid}/items/search?" + "&".join(q)
-        res = mac("raw", {"method": "GET", "path": p}, meli_user_id=cid)
-        if res.get("status") != 200:
-            break
-        data = res.get("data") or {}
-        scroll_id = data.get("scroll_id") or scroll_id
-        lote = data.get("results", [])
-        if not lote:
-            break
-        ids += lote
-        if cap and len(ids) >= cap:
-            return ids[:cap]
-        time.sleep(PAUSA)
-    return ids
+    res = mac_call("category_attributes", {"categoryId": category_id})
+    if res.get("status") != 200 or not isinstance(res.get("data"), list):
+        _cache_categoria[category_id] = []
+        return []
+
+    campos = []
+    for a in res["data"]:
+        tags = a.get("tags") or {}
+        if tags.get("read_only") or tags.get("hidden"):
+            continue
+        if a.get("id") not in CAMPOS_ALVO:
+            continue
+        campos.append({
+            "id": a.get("id"),
+            "name": a.get("name", a.get("id")),
+            "value_type": a.get("value_type"),
+            "values": a.get("values") or [],
+            "required": bool(tags.get("required") or tags.get("catalog_required") or tags.get("fixed")),
+        })
+    _cache_categoria[category_id] = campos
+    return campos
 
 
-def get_item(cid, iid):
-    p = f"/items/{iid}?attributes=id,title,attributes,sale_terms,status"
-    res = mac("raw", {"method": "GET", "path": p}, meli_user_id=cid)
-    return res.get("data") if res.get("status") == 200 else None
-
-
-def amap(item):
-    return {a.get("id"): a for a in item.get("attributes", [])}
-
-
-def vazio(a):
-    if not a:
-        return True
-    return a.get("value_id") in (None, "-1", "") and (a.get("value_name") or "").strip() in ("", "33")
-
-
-def normaliza_codigos(txt):
-    if not txt:
-        return ""
-    bruto = txt.replace("|", "/").replace(";", "/").replace(",", "/")
-    partes, vistos = [], set()
-    for tok in bruto.split("/"):
-        t = tok.strip()
-        if t and t.upper() not in vistos:
-            vistos.add(t.upper()); partes.append(t)
-    return ", ".join(partes)
-
-
-def planeja(item):
-    am = amap(item)
-    novos_attrs, sale_terms, alertas = [], None, []
-
-    if "INMETRO_CERTIFICATION_REGISTRATION_NUMBER" in am and vazio(am["INMETRO_CERTIFICATION_REGISTRATION_NUMBER"]):
-        novos_attrs.append({"id": "INMETRO_CERTIFICATION_REGISTRATION_NUMBER", "value_name": "N/A"})
-
-    if "ORIGIN" in am and vazio(am["ORIGIN"]):
-        novos_attrs.append({"id": "ORIGIN", "value_id": ORIGEM_CHINA})
-
-    oem = (am.get("OEM") or {}).get("value_name") or ""
-    pn  = (am.get("PART_NUMBER") or {}).get("value_name") or ""
-    oem_n, pn_n = normaliza_codigos(oem), normaliza_codigos(pn)
-    if not oem_n and pn_n:
-        oem_n = pn_n
-    if not pn_n and oem_n:
-        pn_n = oem_n
-    if oem_n and oem_n != oem and "OEM" in am:
-        novos_attrs.append({"id": "OEM", "value_name": oem_n})
-    if pn_n and pn_n != pn and "PART_NUMBER" in am:
-        novos_attrs.append({"id": "PART_NUMBER", "value_name": pn_n})
-
-    st = item.get("sale_terms") or []
-    if st:
-        tipo = next((s for s in st if s.get("id") == "WARRANTY_TYPE"), None)
-        precisa = not any(s.get("id") == "WARRANTY_TIME" and
-                          (s.get("value_name") or "").strip().lower() == "90 dias" for s in st)
-        if precisa:
-            novo_st = [{"id": "WARRANTY_TIME", "value_name": "90 dias"}]
-            if tipo:
-                novo_st.append({"id": "WARRANTY_TYPE", "value_id": tipo.get("value_id"),
-                                "value_name": tipo.get("value_name")})
-            sale_terms = novo_st
-
-    tl = (item.get("title") or "").lower()
-    achadas = [g for g in GENUINAS if g in tl]
-    if achadas:
-        alertas.append("titulo:" + ",".join(achadas))
-
-    return novos_attrs, sale_terms, alertas
-
-
-def aplica(cid, iid, attrs, sale_terms):
-    body = {}
-    if attrs:
-        body["attributes"] = attrs
-    if sale_terms:
-        body["sale_terms"] = sale_terms
-    if not body:
-        return None
-    r = mac("raw", {"method": "PUT", "path": f"/items/{iid}", "body": body}, meli_user_id=cid)
-    # Se falhou e o INMETRO estava no meio, tenta DE NOVO sem o INMETRO —
-    # pra um INMETRO problemático não derrubar as correções boas (OEM, Nº de peça, etc).
-    if r and r.get("status") != 200 and attrs:
-        sem_inmetro = [a for a in attrs if a.get("id") != "INMETRO_CERTIFICATION_REGISTRATION_NUMBER"]
-        if sem_inmetro != attrs and (sem_inmetro or sale_terms):
-            body2 = {}
-            if sem_inmetro:
-                body2["attributes"] = sem_inmetro
-            if sale_terms:
-                body2["sale_terms"] = sale_terms
-            r = mac("raw", {"method": "PUT", "path": f"/items/{iid}", "body": body2}, meli_user_id=cid)
-    return r
-
-
-def run_once():
-    modo_txt = "APLICANDO (escrita real)" if APLICAR else "DRY-RUN (só simula)"
-    alvo = f"{STATUS_ALVO}" + (f"/{SUB_STATUS}" if SUB_STATUS else "")
-    log.info(f"🤖 Funcionário Digital — modo={MODO} | alvo={alvo} | {modo_txt}")
-
-    done = carregar_checkpoint()                       # 🧠 retoma de onde parou
-    if done:
-        log.info(f"🧠 Memória: retomando — {len(done)} itens já tratados serão pulados.")
-
-    tot = {"itens": 0, "inmetro": 0, "origem": 0, "codigos": 0, "garantia": 0,
-           "titulo_alerta": 0, "escritos": 0, "erros": 0, "pulados": 0}
-    for c in CONTAS_ML:
-        ids = listar(c["id"])
-        log.info(f"[{c['nome']}] {len(ids)} anúncios ({STATUS_ALVO}, {MODO}).")
-        for i, iid in enumerate(ids, 1):
-            chave = f"{c['id']}:{iid}"
-            if chave in done:                          # 🧠 já tratado nesta passada → pula
-                tot["pulados"] += 1
-                continue
-            item = get_item(c["id"], iid)
-            if not item:
-                tot["erros"] += 1
-                continue                               # não marca: tenta de novo num próximo resume
-            tot["itens"] += 1
-            attrs, sale_terms, alertas = planeja(item)
-            for a in attrs:
-                if a["id"] == "INMETRO_CERTIFICATION_REGISTRATION_NUMBER": tot["inmetro"] += 1
-                if a["id"] == "ORIGIN": tot["origem"] += 1
-                if a["id"] in ("OEM", "PART_NUMBER"): tot["codigos"] += 1
-            if sale_terms: tot["garantia"] += 1
-            if alertas: tot["titulo_alerta"] += 1
-            if attrs or sale_terms:
-                resumo = ", ".join([a["id"] for a in attrs] + (["GARANTIA"] if sale_terms else []))
-                log.info(f"  {iid}: {resumo}" + (f" | ALERTA {alertas}" if alertas else ""))
-                if APLICAR:
-                    r = aplica(c["id"], iid, attrs, sale_terms)
-                    if r and r.get("status") == 200:
-                        tot["escritos"] += 1
-                    else:
-                        tot["erros"] += 1
-                        log.warning(f"    falha: {(r or {}).get('data')}")
-            done.add(chave); marcar_feito(chave)       # 🧠 marca como tratado (sobrevive a reinício)
-            if i % 50 == 0:
-                log.info(f"[{c['nome']}] {i}/{len(ids)}...")
-            time.sleep(PAUSA)
-    limpar_checkpoint()                                # 🧠 passada completa → zera a memória
-    log.info(f"🤖 Passada concluída. {tot}")
-
-
-def main():
-    if not MAC_API_KEY:
-        log.error("MAC_API_KEY ausente"); return
+# ── Claude AI ──────────────────────────────────────────────────
+def analisar_com_claude(titulo, faltantes):
+    linhas = []
+    for f in faltantes:
+        if f["values"]:
+            permitidos = ", ".join(v.get("name", "") for v in f["values"])
+            linhas.append(f"- {f['id']} ({f['name']}) — valores permitidos: {permitidos}")
+        else:
+            linhas.append(f"- {f['id']} ({f['name']}) — texto livre")
+    body = {
+        "model": "claude-haiku-4-5-20251001",
+        "max_tokens": 500,
+        "system": SYSTEM_PROMPT,
+        "messages": [{
+            "role": "user",
+            "content": f"TÍTULO: {titulo}\n\nATRIBUTOS FALTANTES:\n" + "\n".join(linhas),
+        }],
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "x-api-key": CLAUDE_API_KEY,
+        "anthropic-version": "2023-06-01",
+    }
     try:
-        os.makedirs(CHECKPOINT_DIR, exist_ok=True)     # 🧠 garante a pasta da memória
-    except Exception:
-        pass
-    run_once()
-    while INTERVALO_DIAS > 0:
-        log.info(f"😴 Dormindo {INTERVALO_DIAS} dia(s) até a próxima varredura...")
-        time.sleep(INTERVALO_DIAS * 86400)
-        run_once()
+        r = requests.post("https://api.anthropic.com/v1/messages",
+                          json=body, headers=headers, timeout=40)
+        data = r.json()
+        if data.get("content"):
+            texto = data["content"][0]["text"].strip()
+            texto = texto.replace("```json", "").replace("```", "").strip()
+            ini = texto.find("{")
+            if ini > 0:
+                texto = texto[ini:]
+            try:
+                return json.loads(texto).get("atributos", [])
+            except json.JSONDecodeError:
+                obj, _ = json.JSONDecoder().raw_decode(texto)  # ignora texto extra após o JSON
+                return obj.get("atributos", [])
+    except Exception as e:
+        log.error(f"Erro Claude: {e}")
+    return []
+
+
+# ── Monta atributo final, mapeando value_id quando for lista ───
+def montar_attr(campo, value_name):
+    attr = {"id": campo["id"], "value_name": value_name}
+    if campo["values"]:
+        for v in campo["values"]:
+            if (v.get("name") or "").strip().lower() == (value_name or "").strip().lower():
+                attr["value_id"] = v.get("id")
+                attr["value_name"] = v.get("name")
+                break
+        else:
+            return None  # valor fora dos permitidos → descarta por segurança
+    return attr
+
+
+# ── Decide o que preencher em um anúncio ───────────────────────
+def calcular_preenchimentos(item):
+    titulo = item.get("title", "")
+    category_id = item.get("category_id")
+    if not category_id:
+        return []
+
+    campos = campos_da_categoria(category_id)
+    if not campos:
+        return []
+
+    ja_tem = set()
+    for attr in item.get("attributes", []):
+        val = attr.get("value_name")
+        if val and val not in ("", "null", "N/A"):
+            ja_tem.add(attr.get("id"))
+
+    faltantes = [c for c in campos if c["id"] not in ja_tem]
+    if not faltantes:
+        return []
+
+    novos = []
+    pra_ia = []
+    for c in faltantes:
+        if c["id"] == "ITEM_CONDITION":
+            a = montar_attr(c, "Novo")
+            if a:
+                novos.append(a)
+            continue
+        if c["value_type"] == "list" and len(c["values"]) == 1:
+            a = montar_attr(c, c["values"][0].get("name"))
+            if a:
+                novos.append(a)
+            continue
+        if c["id"] == "IS_KIT":
+            ehkit = any(k in titulo.lower() for k in ["kit", "par", "jogo", "conjunto", "c/ 4", "c/4"])
+            a = montar_attr(c, "Sim" if ehkit else "Não")
+            if a:
+                novos.append(a)
+            continue
+        pra_ia.append(c)
+
+    if pra_ia:
+        for sugestao in analisar_com_claude(titulo, pra_ia):
+            campo = next((c for c in pra_ia if c["id"] == sugestao.get("id")), None)
+            if campo:
+                a = montar_attr(campo, sugestao.get("value_name"))
+                if a:
+                    novos.append(a)
+
+    return novos
+
+
+# ── Processa uma conta ─────────────────────────────────────────
+def processar_conta(conta, feitos):
+    cid, nome = conta["id"], conta["nome"]
+    stats = {"verificados": 0, "preenchidos": 0, "sem_alteracao": 0,
+             "erros": 0, "anuncios_atualizados": 0, "pulados": 0}
+    log.info(f"[{nome}] 🔍 Buscando anúncios com health < {HEALTH_MINIMO}...")
+
+    offset = 0
+    erros_seguidos = 0
+    total = None
+
+    while offset < MAX_ANUNCIOS:
+        res = mac_call("list_items", {"limit": LOTE_SIZE, "offset": offset, "status": "active"},
+                       meli_user_id=cid)
+
+        if res.get("status") != 200 or "data" not in res:
+            erros_seguidos += 1
+            log.warning(f"[{nome}] ⚠️ Falha na página offset={offset}: {res.get('error')} "
+                        f"({erros_seguidos}/{MAX_ERROS_PAGINA})")
+            if erros_seguidos >= MAX_ERROS_PAGINA:
+                log.error(f"[{nome}] Muitos erros seguidos — interrompendo esta conta.")
+                break
+            time.sleep(2)   # respira e tenta a MESMA página de novo
+            continue
+        erros_seguidos = 0
+
+        data = res["data"]
+        if total is None:
+            total = (data.get("paging") or {}).get("total")
+            log.info(f"[{nome}] Total de anúncios ativos: {total}")
+
+        items = data.get("items", [])
+        if not items:
+            break
+
+        for item in items:
+            try:
+                health = float(item.get("health") or 0)
+                if health >= HEALTH_MINIMO:
+                    continue
+                stats["verificados"] += 1
+
+                item_id = item.get("id")
+                chave = f"{cid}:{item_id}"
+                if chave in feitos:
+                    stats["pulados"] += 1
+                    continue
+
+                novos = calcular_preenchimentos(item)
+                if not novos:
+                    stats["sem_alteracao"] += 1
+                    marcar_feito(chave)
+                    continue
+
+                titulo = item.get("title", "")[:45]
+                if DRY_RUN:
+                    log.info(f"[{nome}] 🧪 [SIMULAÇÃO] {item_id} | {len(novos)} attr | "
+                             f"{[a['id'] for a in novos]} | {titulo}")
+                    stats["preenchidos"] += len(novos)
+                    stats["anuncios_atualizados"] += 1
+                    marcar_feito(chave)
+                    continue
+
+                res2 = mac_call("raw", {"method": "PUT", "path": f"/items/{item_id}", "body": {"attributes": novos}}, meli_user_id=cid)
+                if res2.get("status") in (200, 201):
+                    log.info(f"[{nome}] ✅ {item_id} | {len(novos)} attr | {titulo}")
+                    stats["preenchidos"] += len(novos)
+                    stats["anuncios_atualizados"] += 1
+                    marcar_feito(chave)
+                else:
+                    log.warning(f"[{nome}] ⚠️ Update falhou {item_id}: {res2.get('error')}")
+                    stats["erros"] += 1   # não marca → tenta de novo na próxima passada
+                time.sleep(PAUSA_UPDATE)
+            except Exception as e:
+                log.error(f"[{nome}] Erro no item {item.get('id')}: {e}")
+                stats["erros"] += 1
+
+        offset += LOTE_SIZE
+        if total is not None and offset >= total:
+            break
+        time.sleep(PAUSA_PAGINA)
+
+    log.info(f"[{nome}] ✅ Concluído: {stats}")
+    return stats
+
+
+# ── Relatório via Telegram ─────────────────────────────────────
+def enviar_relatorio(stats_contas):
+    agora = datetime.now().strftime("%d/%m/%Y às %H:%M")
+    modo = "🧪 SIMULAÇÃO (DRY_RUN)" if DRY_RUN else "🚀 PRODUÇÃO"
+    linhas = [f"<b>📋 Relatório Fichas Técnicas</b>", f"{agora} • {modo}", ""]
+    tot = {"verificados": 0, "preenchidos": 0, "anuncios_atualizados": 0,
+           "sem_alteracao": 0, "erros": 0, "pulados": 0}
+    for nome, s in stats_contas.items():
+        for k in tot:
+            tot[k] += s.get(k, 0)
+        linhas.append(
+            f"<b>{nome}</b>\n"
+            f"  📋 Verificados (health baixo): {s['verificados']}\n"
+            f"  ✅ Atributos preenchidos: {s['preenchidos']}\n"
+            f"  📦 Anúncios atualizados: {s['anuncios_atualizados']}\n"
+            f"  ⏭️ Sem alteração: {s['sem_alteracao']}\n"
+            f"  🧠 Pulados (memória): {s.get('pulados', 0)}\n"
+            f"  ❌ Erros: {s['erros']}"
+        )
+    linhas.append("")
+    linhas.append(f"<b>TOTAL</b> — ✅ {tot['preenchidos']} attr em "
+                  f"{tot['anuncios_atualizados']} anúncios • ❌ {tot['erros']} erros")
+    tg_send("\n".join(linhas))
+
+
+# ── Rodada completa ────────────────────────────────────────────
+def rodar():
+    log.info(f"📋 Iniciando rodada — modo {'SIMULAÇÃO' if DRY_RUN else 'PRODUÇÃO'}")
+    feitos = carregar_checkpoint()
+    stats_contas = {}
+    completou_tudo = True
+    for conta in CONTAS_ML:
+        try:
+            stats_contas[conta["nome"]] = processar_conta(conta, feitos)
+        except Exception as e:
+            log.error(f"Erro na conta {conta['nome']}: {e}")
+            completou_tudo = False
+            stats_contas[conta["nome"]] = {"verificados": 0, "preenchidos": 0, "sem_alteracao": 0,
+                                           "erros": 1, "anuncios_atualizados": 0, "pulados": 0}
+    enviar_relatorio(stats_contas)
+    if completou_tudo:
+        limpar_checkpoint()
+    log.info("📋 Rodada concluída!")
+
+
+# ── MAIN ───────────────────────────────────────────────────────
+def main():
+    log.info("📋 BOT FICHAS TÉCNICAS iniciado!")
+    if not MAC_API_KEY:
+        log.error("❌ MAC_API_KEY não configurada!"); return
+    if not CLAUDE_API_KEY:
+        log.error("❌ CLAUDE_API_KEY não configurada!"); return
+
+    try:
+        os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    except Exception as e:
+        log.warning(f"⚠️ Sem persistência em {CHECKPOINT_DIR} ({e}). "
+                    f"Sem o Volume montado, a memória não sobrevive a restart.")
+
+    # Roda agora ao subir e repete a cada INTERVALO_HORAS (padrão 24h = todo dia).
+    # Quando uma passada parar de preencher coisa nova, é sinal de que zerou o que dava pra zerar.
+    while True:
+        rodar()
+        log.info(f"⏳ Próxima rodada em {INTERVALO_HORAS:.0f}h...")
+        time.sleep(max(60, INTERVALO_HORAS * 3600))
 
 
 if __name__ == "__main__":
