@@ -4,6 +4,7 @@ import json
 import logging
 import requests
 from datetime import datetime
+from urllib.parse import quote
 
 # ── Configurações ──────────────────────────────────────────────
 MAC_API_KEY    = os.environ.get("MAC_API_KEY", "")
@@ -278,42 +279,77 @@ def calcular_preenchimentos(item):
 
 
 # ── Processa uma conta ─────────────────────────────────────────
+def _scan_ids(cid, nome):
+    """Junta TODOS os ids ativos da conta via scan/scroll.
+    Usa search_type=scan (scroll_id) que FURA o teto de offset=1.000 do ML —
+    diferente do list_items por offset, que morria na página 1050."""
+    ids = []
+    scroll_id = None
+    erros_seguidos = 0
+    total_logado = False
+    while len(ids) < MAX_ANUNCIOS:
+        q = ["search_type=scan", "limit=100", "status=active"]
+        if scroll_id:
+            q.append(f"scroll_id={quote(scroll_id, safe='')}")
+        p = f"/users/{cid}/items/search?" + "&".join(q)
+        res = mac_call("raw", {"method": "GET", "path": p}, meli_user_id=cid)
+
+        if res.get("status") != 200 or "data" not in res:
+            erros_seguidos += 1
+            log.warning(f"[{nome}] ⚠️ Falha no scan: {res.get('error')} "
+                        f"({erros_seguidos}/{MAX_ERROS_PAGINA})")
+            if erros_seguidos >= MAX_ERROS_PAGINA:
+                log.error(f"[{nome}] Muitos erros seguidos no scan — interrompendo esta conta.")
+                break
+            time.sleep(2)
+            continue
+        erros_seguidos = 0
+
+        data = res["data"]
+        if not total_logado:
+            total = (data.get("paging") or {}).get("total")
+            log.info(f"[{nome}] Total de anúncios ativos: {total}")
+            total_logado = True
+
+        scroll_id = data.get("scroll_id") or scroll_id
+        lote = data.get("results", [])
+        if not lote:
+            break
+        ids += lote
+        time.sleep(PAUSA_PAGINA)
+
+    return ids[:MAX_ANUNCIOS]
+
+
 def processar_conta(conta, feitos):
     cid, nome = conta["id"], conta["nome"]
     stats = {"verificados": 0, "preenchidos": 0, "sem_alteracao": 0,
              "erros": 0, "anuncios_atualizados": 0, "pulados": 0}
     log.info(f"[{nome}] 🔍 Buscando anúncios com health < {HEALTH_MINIMO}...")
 
-    offset = 0
-    erros_seguidos = 0
-    total = None
+    ids = _scan_ids(cid, nome)
 
-    while offset < MAX_ANUNCIOS:
-        res = mac_call("list_items", {"limit": LOTE_SIZE, "offset": offset, "status": "active"},
+    # Multiget de 20 em 20 (ML aceita até 20 ids por chamada). Traz health +
+    # array de atributos numa tacada só, pra decidir E preencher.
+    CAMPOS = "id,health,status,title,attributes"
+    for i in range(0, len(ids), 20):
+        bloco = ids[i:i + 20]
+        res = mac_call("raw", {"method": "GET",
+                       "path": f"/items?ids={','.join(bloco)}&attributes={CAMPOS}"},
                        meli_user_id=cid)
-
         if res.get("status") != 200 or "data" not in res:
-            erros_seguidos += 1
-            log.warning(f"[{nome}] ⚠️ Falha na página offset={offset}: {res.get('error')} "
-                        f"({erros_seguidos}/{MAX_ERROS_PAGINA})")
-            if erros_seguidos >= MAX_ERROS_PAGINA:
-                log.error(f"[{nome}] Muitos erros seguidos — interrompendo esta conta.")
-                break
-            time.sleep(2)   # respira e tenta a MESMA página de novo
+            log.warning(f"[{nome}] ⚠️ Falha no multiget (bloco {i}): {res.get('error')}")
+            stats["erros"] += 1
+            time.sleep(2)
             continue
-        erros_seguidos = 0
 
-        data = res["data"]
-        if total is None:
-            total = (data.get("paging") or {}).get("total")
-            log.info(f"[{nome}] Total de anúncios ativos: {total}")
-
-        items = data.get("items", [])
-        if not items:
-            break
-
-        for item in items:
+        for entry in res["data"]:
+            if entry.get("code") != 200:
+                continue
+            item = entry.get("body") or {}
             try:
+                if item.get("status") != "active":
+                    continue
                 health = float(item.get("health") or 0)
                 if health >= HEALTH_MINIMO:
                     continue
@@ -353,11 +389,6 @@ def processar_conta(conta, feitos):
             except Exception as e:
                 log.error(f"[{nome}] Erro no item {item.get('id')}: {e}")
                 stats["erros"] += 1
-
-        offset += LOTE_SIZE
-        if total is not None and offset >= total:
-            break
-        time.sleep(PAUSA_PAGINA)
 
     log.info(f"[{nome}] ✅ Concluído: {stats}")
     return stats
