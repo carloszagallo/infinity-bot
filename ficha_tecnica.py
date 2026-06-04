@@ -67,9 +67,11 @@ Se não tiver certeza de nenhum, responda: {"atributos": []}"""
 
 # ── MAC API ────────────────────────────────────────────────────
 def mac_call(action, params=None, meli_user_id=None):
-    payload = {"action": action, "params": params or {}}
+    # roteamento por conta vai DENTRO de params (no topo eh ignorado -> token INFINITY)
+    params = dict(params or {})
     if meli_user_id:
-        payload["meli_user_id"] = meli_user_id
+        params["meli_user_id"] = meli_user_id
+    payload = {"action": action, "params": params}
     headers = {"Content-Type": "application/json", "x-api-key": MAC_API_KEY}
     try:
         r = requests.post(MAC_BASE_URL, json=payload, headers=headers, timeout=40)
@@ -430,3 +432,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
