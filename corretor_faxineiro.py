@@ -107,9 +107,12 @@ def limpar_checkpoint():
 
 # ───────── API (MAC / tiops) ─────────
 def mac(action, params=None, meli_user_id=None):
-    payload = {"action": action, "params": params or {}}
+    # ⚠️ O roteamento por conta da Tiops lê o meli_user_id de DENTRO de params.
+    # No topo do payload ele é IGNORADO -> cai no token padrao (INFINITY).
+    params = dict(params or {})
     if meli_user_id:
-        payload["meli_user_id"] = meli_user_id
+        params["meli_user_id"] = meli_user_id
+    payload = {"action": action, "params": params}
     try:
         r = requests.post(MAC_BASE_URL, json=payload,
                           headers={"Content-Type": "application/json", "x-api-key": MAC_API_KEY},
@@ -512,3 +515,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
