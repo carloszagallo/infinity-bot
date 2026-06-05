@@ -27,6 +27,8 @@ SEGURANÇA:
   - Idempotente, por merge (PUT). Nunca toca em foto. Nunca contorna moderação.
   - Relatório é independente e seguro (só leitura). Falha de envio não derruba a rodada.
 """
+# DEPLOY STAMP: 2026-06-05 — fix de roteamento por conta (meli_user_id dentro de params).
+# Este comentário existe pra forçar o watch path do Railway a rebuildar este serviço.
 import os, io, re, csv, time, json, smtplib, logging, requests
 from urllib.parse import quote
 from email.message import EmailMessage
@@ -515,4 +517,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
