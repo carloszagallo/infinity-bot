@@ -27,7 +27,7 @@ SEGURANÇA:
   - Idempotente, por merge (PUT). Nunca toca em foto. Nunca contorna moderação.
   - Relatório é independente e seguro (só leitura). Falha de envio não derruba a rodada.
 """
-# DEPLOY STAMP: 2026-06-05 — fix de roteamento por conta (meli_user_id dentro de params).
+# DEPLOY STAMP: 2026-06-05b — roteamento por conta + round-robin entre contas (MAX_NOVOS_POR_CONTA).
 # Este comentário existe pra forçar o watch path do Railway a rebuildar este serviço.
 import os, io, re, csv, time, json, smtplib, logging, requests
 from urllib.parse import quote
@@ -44,6 +44,7 @@ MODO           = os.environ.get("MODO", "full").lower()          # full | increm
 STATUS_ALVO    = os.environ.get("STATUS_ALVO", "active")          # active | paused | all
 SUB_STATUS     = os.environ.get("SUB_STATUS", "").strip()
 MAX_ITENS      = int(os.environ.get("MAX_ITENS", "0"))
+MAX_NOVOS_POR_CONTA = int(os.environ.get("MAX_NOVOS_POR_CONTA", "0"))  # itens NOVOS por conta por passada (0 = sem limite). Faz todas as contas avancarem juntas.
 INTERVALO_DIAS = float(os.environ.get("INTERVALO_DIAS", "0"))
 PAUSA          = float(os.environ.get("PAUSA", "0.25"))
 
@@ -417,6 +418,58 @@ def enviar_relatorio(buckets, tot):
                  corpo.replace("<b>", "").replace("</b>", "").replace("&lt;", "<"), anexos)
 
 
+def _processa_item(c, iid, i, total_ids, item, done, tot, buckets, vel):
+    chave = f"{c['id']}:{iid}"
+    tot["itens"] += 1
+
+    # --- correções determinísticas (como antes) ---
+    attrs, sale_terms, alertas = planeja(item)
+    for a in attrs:
+        if a["id"] == "INMETRO_CERTIFICATION_REGISTRATION_NUMBER": tot["inmetro"] += 1
+        if a["id"] == "ORIGIN": tot["origem"] += 1
+        if a["id"] in ("OEM", "PART_NUMBER"): tot["codigos"] += 1
+    if sale_terms: tot["garantia"] += 1
+    if alertas: tot["titulo_alerta"] += 1
+    if attrs or sale_terms:
+        if APLICAR:
+            r = aplica(c["id"], iid, attrs, sale_terms)
+            if r and r.get("status") == 200: tot["escritos"] += 1
+            else: tot["erros"] += 1; log.warning(f"    falha: {(r or {}).get('data')}")
+
+    # --- relatório (read-only) ---
+    if RELATORIO:
+        titulo = item.get("title", ""); am = amap(item)
+        health = item.get("health"); qty = item.get("available_quantity", 0)
+        logistic = (item.get("shipping") or {}).get("logistic_type", "")
+        tags = item.get("tags") or []; sub = item.get("sub_status") or []
+        sku = (am.get("SELLER_SKU") or {}).get("value_name") or ""
+        v = vel.get(iid, 0)
+        # precisa_foto
+        if foto_px(item) < MIN_PHOTO_PX or (health is not None and health < HEALTH_MIN):
+            buckets["precisa_foto"].append([c["nome"], iid, titulo, health, foto_px(item), qty])
+        # repor_ja
+        if v > 0 and (qty / v) < COVERAGE_DAYS:
+            buckets["repor_ja"].append([c["nome"], iid, titulo, qty, round(v, 2), int(qty / v)])
+        # migrar_full
+        if v >= 1 and logistic != "fulfillment":
+            buckets["migrar_full"].append([c["nome"], iid, titulo, round(v, 2), logistic])
+        # compat_faltando (tag de incompleto) + tenta candidato/cópia
+        if any("incomplete" in t and "compat" in t for t in tags) or "incomplete_position_compatibilities" in tags:
+            buckets["compat_faltando"].append([c["nome"], iid, titulo, sku])
+            st = copiar_compatibilidade(c["id"], iid, sku, item)
+            if st.startswith("copiado"): tot["compat"] += 1
+            log.info(f"  compat {iid}: {st}")
+        # revisao_humana (pausado por motivo que não é estoque)
+        if item.get("status") == "paused" and "out_of_stock" not in sub:
+            motivo = "moderação/duplicado" if "moderation_penalty" in tags else "ficha/outro"
+            buckets["revisao_humana"].append([c["nome"], iid, titulo, motivo, ";".join(tags)])
+
+    done.add(chave); marcar_feito(chave)
+    if i % 50 == 0:
+        log.info(f"[{c['nome']}] {i}/{total_ids}...")
+    time.sleep(PAUSA)
+
+
 def run_once():
     modo_txt = "APLICANDO (escrita real)" if APLICAR else "DRY-RUN (só simula)"
     log.info(f"🤖 Corretor Faxineiro — modo={MODO} | alvo={STATUS_ALVO} | {modo_txt} "
@@ -430,66 +483,40 @@ def run_once():
            "titulo_alerta": 0, "escritos": 0, "erros": 0, "pulados": 0, "compat": 0}
     buckets = {k: [] for k in HEADERS}
 
+    # 1) varre os ids de TODAS as contas primeiro (scan é barato; só ids)
+    fila = []
     for c in CONTAS_ML:
         log.info(f"[{c['nome']}] iniciando varredura...")
         vel = velocidade_vendas(c["id"]) if (RELATORIO and REPOR_JA) else {}
         ids = listar(c["id"])
         log.info(f"[{c['nome']}] {len(ids)} anúncios ({STATUS_ALVO}, {MODO}).")
-        for i, iid in enumerate(ids, 1):
-            chave = f"{c['id']}:{iid}"
-            if chave in done:
-                tot["pulados"] += 1; continue
-            item = get_item(c["id"], iid)
-            if not item:
-                tot["erros"] += 1; continue
-            tot["itens"] += 1
+        fila.append({"c": c, "vel": vel, "ids": ids, "pos": 0})
 
-            # --- correções determinísticas (como antes) ---
-            attrs, sale_terms, alertas = planeja(item)
-            for a in attrs:
-                if a["id"] == "INMETRO_CERTIFICATION_REGISTRATION_NUMBER": tot["inmetro"] += 1
-                if a["id"] == "ORIGIN": tot["origem"] += 1
-                if a["id"] in ("OEM", "PART_NUMBER"): tot["codigos"] += 1
-            if sale_terms: tot["garantia"] += 1
-            if alertas: tot["titulo_alerta"] += 1
-            if attrs or sale_terms:
-                if APLICAR:
-                    r = aplica(c["id"], iid, attrs, sale_terms)
-                    if r and r.get("status") == 200: tot["escritos"] += 1
-                    else: tot["erros"] += 1; log.warning(f"    falha: {(r or {}).get('data')}")
-
-            # --- relatório (read-only) ---
-            if RELATORIO:
-                titulo = item.get("title", ""); am = amap(item)
-                health = item.get("health"); qty = item.get("available_quantity", 0)
-                logistic = (item.get("shipping") or {}).get("logistic_type", "")
-                tags = item.get("tags") or []; sub = item.get("sub_status") or []
-                sku = (am.get("SELLER_SKU") or {}).get("value_name") or ""
-                v = vel.get(iid, 0)
-                # precisa_foto
-                if foto_px(item) < MIN_PHOTO_PX or (health is not None and health < HEALTH_MIN):
-                    buckets["precisa_foto"].append([c["nome"], iid, titulo, health, foto_px(item), qty])
-                # repor_ja
-                if v > 0 and (qty / v) < COVERAGE_DAYS:
-                    buckets["repor_ja"].append([c["nome"], iid, titulo, qty, round(v, 2), int(qty / v)])
-                # migrar_full
-                if v >= 1 and logistic != "fulfillment":
-                    buckets["migrar_full"].append([c["nome"], iid, titulo, round(v, 2), logistic])
-                # compat_faltando (tag de incompleto) + tenta candidato/cópia
-                if any("incomplete" in t and "compat" in t for t in tags) or "incomplete_position_compatibilities" in tags:
-                    buckets["compat_faltando"].append([c["nome"], iid, titulo, sku])
-                    st = copiar_compatibilidade(c["id"], iid, sku, item)
-                    if st.startswith("copiado"): tot["compat"] += 1
-                    log.info(f"  compat {iid}: {st}")
-                # revisao_humana (pausado por motivo que não é estoque)
-                if item.get("status") == "paused" and "out_of_stock" not in sub:
-                    motivo = "moderação/duplicado" if "moderation_penalty" in tags else "ficha/outro"
-                    buckets["revisao_humana"].append([c["nome"], iid, titulo, motivo, ";".join(tags)])
-
-            done.add(chave); marcar_feito(chave)
-            if i % 50 == 0:
-                log.info(f"[{c['nome']}] {i}/{len(ids)}...")
-            time.sleep(PAUSA)
+    # 2) round-robin: processa até MAX_NOVOS_POR_CONTA itens NOVOS de cada conta por
+    #    rodada, girando entre as contas até zerar todas. Assim nenhuma conta monopoliza
+    #    a passada e as 4 avançam juntas. (default 0 = sem limite = uma conta por vez,
+    #    como antes — quem liga o round-robin é a variável MAX_NOVOS_POR_CONTA.)
+    chunk = MAX_NOVOS_POR_CONTA or 10**9
+    restam = True
+    while restam:
+        restam = False
+        for f in fila:
+            c, vel, ids = f["c"], f["vel"], f["ids"]
+            feitos = 0
+            while f["pos"] < len(ids) and feitos < chunk:
+                f["pos"] += 1
+                i = f["pos"]
+                iid = ids[i - 1]
+                chave = f"{c['id']}:{iid}"
+                if chave in done:
+                    tot["pulados"] += 1; continue
+                item = get_item(c["id"], iid)
+                if not item:
+                    tot["erros"] += 1; continue
+                _processa_item(c, iid, i, len(ids), item, done, tot, buckets, vel)
+                feitos += 1
+            if f["pos"] < len(ids):
+                restam = True
 
     limpar_checkpoint()
     log.info(f"🤖 Passada concluída. {tot}")
