@@ -20,7 +20,7 @@ SEGURANÇA:
     ESTIMATIVA de quantos dias o backfill vai levar. Depois PARA.
   • Só ligamos a escrita (DRY_RUN=false) depois que a medição confirmar os números.
 
-DEPLOY STAMP: 2026-06-05c — fusão inicial (DRY_RUN + medição).
+DEPLOY STAMP: 2026-06-06 — escrita auditável (log por ID), RESET_CHECKPOINT, contadores no relatório.
 """
 import os, re, csv, io, json, time, logging, requests
 from datetime import datetime, timezone
@@ -53,6 +53,7 @@ DATA_DIR        = os.environ.get("CHECKPOINT_DIR", "/data")
 CHECKPOINT_FILE = os.path.join(DATA_DIR, "unico_checkpoint.txt")         # itens já tratados NESTA passada (retoma após restart)
 SKU_FILE        = os.path.join(DATA_DIR, "unico_skus.json")              # conhecimento por SKU (persistente)
 MEMORIA_DIAS    = float(os.environ.get("MEMORIA_DIAS", "30"))            # validade da ficha por SKU
+RESET_CHECKPOINT = os.environ.get("RESET_CHECKPOINT", "false").lower() == "true"  # zera o checkpoint no início (one-shot)
 
 # Relatório (reaproveita Telegram do Atendente)
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_BOT_TOKEN", os.environ.get("TELEGRAM_TOKEN", ""))
@@ -439,6 +440,12 @@ def run_once():
 
     done = carregar_checkpoint()
     skus = carregar_skus()
+    _reset_marker = os.path.join(DATA_DIR, "reset_done.flag")
+    if RESET_CHECKPOINT and not os.path.exists(_reset_marker):
+        limpar_checkpoint(); done = set()
+        try: open(_reset_marker, "w").close()
+        except Exception: pass
+        log.info("🧠 RESET_CHECKPOINT — checkpoint zerado UMA vez (restarts daqui pra frente retomam).")
     if done:  log.info(f"🧠 Checkpoint: {len(done)} itens já tratados nesta passada.")
     if skus:  log.info(f"🧠 Memória SKU: {len(skus)} produtos já conhecidos.")
 
@@ -513,14 +520,19 @@ def run_once():
                             r = aplica(c["id"], iid, attrs, sale_terms)
                             if r and r.get("status") in (200, 201):
                                 tot["escritos"] += 1; por_conta[c["nome"]]["escritas"] += 1
+                                log.info(f"  ✅ [{c['nome']}] {iid} | {[a['id'] for a in attrs]}"
+                                         f"{' +garantia90d' if sale_terms else ''}")
                             else:
                                 tot["erros"] += 1
-                                log.warning(f"  [{c['nome']}] falha {iid}: {(r or {}).get('data') or (r or {}).get('error')}")
+                                log.warning(f"  ❌ [{c['nome']}] falha {iid}: {(r or {}).get('data') or (r or {}).get('error')}")
                             time.sleep(PAUSA)
 
-                    done.add(chave); marcar_feito(chave)
+                    done.add(chave)
+                    if not DRY_RUN:
+                        marcar_feito(chave)   # em DRY_RUN não suja o checkpoint
                     if tot["itens"] % 50 == 0:
-                        log.info(f"  {tot['itens']} itens | escrever:{tot['precisa_escrita']} "
+                        log.info(f"  {tot['itens']} itens | precisam_ajuste:{tot['precisa_escrita']} "
+                                 f"| gravados:{tot['escritos']} falhas:{tot['erros']} "
                                  f"| IA nova:{tot['ia_novas']} reuso:{tot['ia_reuso']}")
                     if medindo and tot["itens"] >= MEDIR_N:
                         parar = True; break
@@ -573,8 +585,11 @@ def relatorio_medicao(tot, total_geral, taxa, skus_conhecidos):
         f"• Tempo p/ as escritas (~{WRITES_POR_SEG}/s): ~<b>{dias_escrita:.1f} dias</b>\n"
         f"• Ao ritmo medido (IA fria, pior caso): ~{dias_taxa:.1f} dias\n"
         f"   → na prática fica ENTRE os dois (o cache de SKU acelera ao longo do tempo)\n\n"
-        f"DRY_RUN={DRY_RUN} — nada foi escrito. "
-        f"Pra rodar de verdade: DRY_RUN=false e MEDIR_N=0."
+        + (f"DRY_RUN=true — nada foi escrito (simulação pura).\n"
+           f"Pra valer: DRY_RUN=false e MEDIR_N=0."
+           if DRY_RUN else
+           f"⚠️ ESCRITA REAL feita nesta amostra: <b>{tot['escritos']} gravados, {tot['erros']} falhas</b>.\n"
+           f"Backfill total: DRY_RUN=false e MEDIR_N=0 (+ RESET_CHECKPOINT=true uma vez).")
     )
     log.info("📏 MEDIÇÃO:\n" + re.sub(r"<[^>]+>", "", msg))
     telegram(msg)
@@ -597,3 +612,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
