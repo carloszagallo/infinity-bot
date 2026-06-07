@@ -410,116 +410,183 @@ def processar_avaliacoes(conta):
                 stats[cid]["avaliacoes_respondidas"] += 1
 
 
-# ── PROMOÇÕES ──────────────────────────────────────────────────
+# ── PROMOÇÕES — inscrição item a item ──────────────────────────
 MARCAS_BLOQUEADAS  = ["kers", "KERS", "Kers"]
 PRECO_MINIMO       = float(os.environ.get("PRECO_MINIMO", "19.0"))
 
+# Tipos em que se entra ITEM A ITEM (SMART: ML co-participa; DEAL: preço por item)
+TIPOS_ITEM_PROMO   = {"SMART", "DEAL"}
+# Tipos geridos pela ML / cupom / auto-financiados / pré-acordo — NÃO mexer
+TIPOS_PROMO_IGNORAR = {
+    "LIGHTNING", "UNHEALTHY_STOCK", "PRICE_MATCHING", "PRE_NEGOTIATED",
+    "SELLER_COUPON_CAMPAIGN", "PRICE_DISCOUNT", "MARKETPLACE_CAMPAIGN",
+}
 
-def item_permitido_para_promocao(item_id, desconto_pct, cid):
-    """Retorna (permitido, motivo) verificando marca KERS e preço mínimo."""
-    # get_item (singular) traz os atributos; sem eles o check da marca KERS NÃO funcionava.
+# Trava de segurança: começa SIMULANDO. Só escreve quando você ligar (DRY_RUN_PROMO=false).
+DRY_RUN_PROMO     = os.environ.get("DRY_RUN_PROMO", "true").lower() == "true"
+TESTE_N_PROMO     = int(os.environ.get("TESTE_N_PROMO", "0"))      # máx. inscrições por conta/rodada no modo REAL (0 = sem limite)
+CONTA_PROMO       = os.environ.get("CONTA_PROMO", "").strip()       # restringe a 1 conta (id); vazio = todas
+CHECAR_KERS       = os.environ.get("CHECAR_KERS", "true").lower() == "true"
+PROMO_PAGE        = int(os.environ.get("PROMO_PAGE", "50"))
+PAUSA_ITEM_PROMO  = float(os.environ.get("PAUSA_ITEM_PROMO", "0.4"))
+PAUSA_LOTE_PROMO  = float(os.environ.get("PAUSA_LOTE_PROMO", "1.2"))
+MAX_PAGINAS_PROMO = int(os.environ.get("MAX_PAGINAS_PROMO", "100"))
+
+
+def _marca_kers(item_id, cid):
+    """True se a marca do item for KERS (bloqueada). Faz 1 get_item."""
     res = mac_call("get_item", {"itemId": item_id}, meli_user_id=cid)
     if res.get("status") != 200:
-        return False, "não foi possível verificar o item"
-    item = res.get("data") or {}
-    if not item:
-        return False, "item não encontrado"
-    preco = float(item.get("price", 0) or 0)
-    attrs = item.get("attributes") or []
-    marca = ""
-    for a in attrs:
+        return False
+    for a in ((res.get("data") or {}).get("attributes") or []):
         if a.get("id") == "BRAND":
-            marca = (a.get("value_name") or "").strip()
-            break
+            marca = (a.get("value_name") or "").strip().lower()
+            return any(k.lower() in marca for k in MARCAS_BLOQUEADAS)
+    return False
 
-    # Verifica marca KERS
-    if any(k.lower() in marca.lower() for k in MARCAS_BLOQUEADAS):
-        return False, f"marca KERS bloqueada ({marca})"
 
-    # Verifica preço mínimo após desconto
-    preco_final = round(preco * (1 - desconto_pct / 100), 2)
-    if preco_final < PRECO_MINIMO:
-        return False, f"preço final R$ {preco_final:.2f} abaixo do mínimo R$ {PRECO_MINIMO:.2f}"
+def _oferta_do_item(it, tipo):
+    """(minha_parte_%, deal_price|None, preco_final) ou None se não dá pra entrar <= teto."""
+    orig = float(it.get("original_price", 0) or 0)
+    if orig <= 0:
+        return None
+    if tipo == "SMART":
+        meu   = float(it.get("seller_percentage", 0) or 0)    # ML já define a oferta; sua parte vem pronta
+        preco = float(it.get("price", 0) or 0)
+        return (round(meu, 2), None, round(preco, 2))         # SMART entra por offer_id
+    if tipo == "DEAL":
+        maxp = float(it.get("max_discounted_price", 0) or 0)  # maior preço aceito = MENOR desconto exigido
+        if maxp <= 0:
+            return None
+        meu = round((orig - maxp) / orig * 100, 2)
+        return (meu, round(maxp, 2), round(maxp, 2))
+    return None
 
-    return True, "ok"
+
+def _inscrever_item(cid, item_id, promo, it, deal_price):
+    """POST que inscreve o item na campanha. Retorna (ok, msg_erro)."""
+    tipo = promo.get("type")
+    body = {"promotion_id": promo.get("id"), "promotion_type": tipo}
+    if tipo == "SMART":
+        body["offer_id"] = it.get("offer_id")
+    elif tipo == "DEAL":
+        body["deal_price"] = deal_price
+    r = mac_call("raw", {
+        "method": "POST",
+        "path": f"/seller-promotions/items/{item_id}?app_version=v2",
+        "body": body,
+    }, meli_user_id=cid)
+    if r.get("status") in (200, 201):
+        return True, ""
+    return False, ((r.get("data") or {}).get("message") or r.get("error", "") or "erro")
 
 
 def processar_promocoes(conta):
     cid  = conta["id"]
     nome = conta["nome"]
-    res  = mac_call("ml_list_promotions", {"limit": 50}, meli_user_id=cid)
-    if res.get("status") != 200:
-        log.warning(f"[{nome}] ⚠️  Não foi possível buscar promoções")
+    if CONTA_PROMO and str(cid) != CONTA_PROMO:
         return
 
-    promocoes = (res.get("data") or {}).get("results", [])
-    log.info(f"[{nome}] 🏷️  {len(promocoes)} promoção(ões)")
+    res = mac_call("ml_list_promotions", {"limit": 50}, meli_user_id=cid)
+    if res.get("status") != 200:
+        log.warning(f"[{nome}] ⚠️  Não foi possível buscar campanhas")
+        return
+    campanhas = (res.get("data") or {}).get("results", []) or []
+    modo = "🧪 DRY (simulando)" if DRY_RUN_PROMO else "✍️  REAL"
+    log.info(f"[{nome}] 🏷️  {len(campanhas)} campanha(s) | {modo} | teto sua parte {MAX_DESCONTO_MEU}%")
 
-    for promo in promocoes:
-        promo_id = promo.get("id")
-        status   = promo.get("status", "")
-        nome_p   = promo.get("name", promo_id)
+    inscritos_conta = 0
+    ja_vistos = set()   # não inscreve o mesmo item em 2 campanhas na mesma rodada
 
-        if status == "started":
-            log.info(f"[{nome}] ✅ Já ativa: {nome_p}")
+    for promo in campanhas:
+        tipo   = promo.get("type", "")
+        nome_p = promo.get("name", promo.get("id"))
+        status = promo.get("status", "")
+
+        if tipo in TIPOS_PROMO_IGNORAR:
+            continue
+        if tipo not in TIPOS_ITEM_PROMO:
+            log.info(f"[{nome}] ⏭️  Pulada (tipo {tipo} não tratado): {nome_p}")
+            continue
+        if status not in ("started", "pending"):
             continue
 
-        desconto  = float(promo.get("discount_percentage", 0) or 0)
-        copart_ml = float(promo.get("marketplace_discount_percentage", 0) or 0)
-        meu_desc  = round(desconto - copart_ml, 2)
+        ins = caros = piso = kers = 0
+        search_after = None
+        paginas = 0
+        parar = False
 
-        # Verifica horário comercial (seg-sex 08h-18h) para regras KERS/preço
-        agora_local = agora_br()
-        horario_comercial = (agora_local.weekday() < 5 and 8 <= agora_local.hour < 18)
+        while paginas < MAX_PAGINAS_PROMO and not parar:
+            path = (f"/seller-promotions/promotions/{promo.get('id')}/items"
+                    f"?promotion_type={tipo}&app_version=v2&limit={PROMO_PAGE}")
+            if search_after:
+                path += f"&search_after={search_after}"
+            r = mac_call("raw", {"method": "GET", "path": path}, meli_user_id=cid)
+            if r.get("status") != 200:
+                log.warning(f"[{nome}] ⚠️  Não listou itens de {nome_p}: {r.get('error','')}")
+                break
+            data  = r.get("data") or {}
+            itens = data.get("results", []) or []
+            if not itens:
+                break
 
-        # Promoção FLEXÍVEL — participa com desconto mínimo (6%)
-        sub_type = promo.get("sub_type", "")
-        if sub_type == "FLEXIBLE_PERCENTAGE":
-            desconto  = 6.0
-            copart_ml = float(promo.get("marketplace_discount_percentage", 0) or 0)
-            meu_desc  = round(desconto - copart_ml, 2)
-            log.info(f"[{nome}] 🔧 Promoção flexível — usando desconto mínimo 6%: {nome_p}")
-
-        # Verifica desconto máximo
-        if meu_desc > MAX_DESCONTO_MEU:
-            log.warning(f"[{nome}] ❌ Ignorada ({meu_desc}% > {MAX_DESCONTO_MEU}%): {nome_p}")
-            stats[cid]["promocoes_ignoradas"] += 1
-            continue
-
-        # Busca itens da promoção para verificar KERS e preço mínimo
-        bloqueada = False
-        try:
-            res_items = mac_call("ml_promotion_items", {"promotion_id": promo_id, "limit": 10}, meli_user_id=cid)
-            items_promo = []
-            if res_items.get("status") == 200:
-                items_promo = (res_items.get("data") or {}).get("results", [])
-
-            for it in items_promo[:5]:  # verifica até 5 itens por promoção
-                item_id = it.get("item_id") or it.get("id")
-                if not item_id:
+            for it in itens:
+                if it.get("status") != "candidate":
                     continue
-                permitido, motivo = item_permitido_para_promocao(item_id, desconto, cid)
-                if not permitido:
-                    log.warning(f"[{nome}] 🚫 Bloqueada — {motivo}: {nome_p}")
-                    stats[cid]["promocoes_ignoradas"] += 1
-                    bloqueada = True
+                item_id = it.get("id")
+                if not item_id or item_id in ja_vistos:
+                    continue
+                oferta = _oferta_do_item(it, tipo)
+                if not oferta:
+                    continue
+                meu_pct, deal_price, preco_final = oferta
+
+                if meu_pct > MAX_DESCONTO_MEU:
+                    caros += 1
+                    continue
+                if preco_final and preco_final < PRECO_MINIMO:
+                    piso += 1
+                    continue
+                if (not DRY_RUN_PROMO) and CHECAR_KERS and _marca_kers(item_id, cid):
+                    kers += 1
+                    continue
+
+                if DRY_RUN_PROMO:
+                    ins += 1
+                    ja_vistos.add(item_id)
+                    if ins <= 5:
+                        log.info(f"[{nome}] 🧪 inscreveria {item_id} → {nome_p} ({meu_pct}% | R$ {preco_final})")
+                else:
+                    ok, err = _inscrever_item(cid, item_id, promo, it, deal_price)
+                    if ok:
+                        ins += 1
+                        ja_vistos.add(item_id)
+                        log.info(f"[{nome}] ✅ {item_id} → {nome_p} ({meu_pct}% | R$ {preco_final})")
+                    else:
+                        log.warning(f"[{nome}] ❌ {item_id} → {nome_p}: {err}")
+                    time.sleep(PAUSA_ITEM_PROMO)
+
+                if (not DRY_RUN_PROMO) and TESTE_N_PROMO and (inscritos_conta + ins) >= TESTE_N_PROMO:
+                    parar = True
                     break
-        except Exception as e:
-            log.warning(f"[{nome}] ⚠️  Erro ao verificar itens de {nome_p}: {e}")
 
-        if bloqueada:
-            continue
+            paginas += 1
+            search_after = (data.get("paging") or {}).get("searchAfter")
+            if not search_after:
+                break
+            time.sleep(PAUSA_LOTE_PROMO)
 
-        # Tudo ok — ativa a promoção
-        params_ativacao = {"promotion_id": promo_id, "status": "started"}
-        if sub_type == "FLEXIBLE_PERCENTAGE":
-            params_ativacao["discount_percentage"] = desconto
-        res2 = mac_call("ml_update_promotion", params_ativacao, meli_user_id=cid)
-        if res2.get("status") in [200, 201]:
-            log.info(f"[{nome}] 🏷️  Ativada: {nome_p} ({meu_desc}%)")
-            stats[cid]["promocoes_ativadas"] += 1
-        else:
-            log.warning(f"[{nome}] ⚠️  Não ativou: {nome_p} — {res2.get('error','')}")
+        inscritos_conta += ins
+        stats[cid]["promocoes_ativadas"]  += ins
+        stats[cid]["promocoes_ignoradas"] += caros
+        log.info(f"[{nome}] 🏷️  {nome_p}: inscritos {ins} | caros>{MAX_DESCONTO_MEU}% {caros} | piso {piso} | kers {kers}")
+
+        if (not DRY_RUN_PROMO) and TESTE_N_PROMO and inscritos_conta >= TESTE_N_PROMO:
+            log.info(f"[{nome}] 🧪 limite de teste ({TESTE_N_PROMO}) atingido — parando conta.")
+            break
+
+    suf = " (simuladas)" if DRY_RUN_PROMO else ""
+    log.info(f"[{nome}] 🏁 Promoções: {inscritos_conta} inscrição(ões){suf}")
 
 
 # ── LOOP PRINCIPAL ─────────────────────────────────────────────
@@ -577,4 +644,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
