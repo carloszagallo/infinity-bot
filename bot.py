@@ -432,6 +432,12 @@ PAUSA_ITEM_PROMO  = float(os.environ.get("PAUSA_ITEM_PROMO", "0.4"))
 PAUSA_LOTE_PROMO  = float(os.environ.get("PAUSA_LOTE_PROMO", "1.2"))
 MAX_PAGINAS_PROMO = int(os.environ.get("MAX_PAGINAS_PROMO", "100"))
 
+# Teto da SUA parte, separado por tipo de financiamento:
+#  - COOP    : campanhas onde a ML co-participa (ex.: SMART, tem meli_percentage)  -> default 7%
+#  - PROPRIO : campanhas 100% por sua conta (ex.: DEAL, sem co-participação)        -> default 5%
+MAX_DESCONTO_COOP    = float(os.environ.get("MAX_DESCONTO_COOP", str(MAX_DESCONTO_MEU)))
+MAX_DESCONTO_PROPRIO = float(os.environ.get("MAX_DESCONTO_PROPRIO", "5.0"))
+
 
 def _marca_kers(item_id, cid):
     """True se a marca do item for KERS (bloqueada). Faz 1 get_item."""
@@ -446,20 +452,22 @@ def _marca_kers(item_id, cid):
 
 
 def _oferta_do_item(it, tipo):
-    """(minha_parte_%, deal_price|None, preco_final) ou None se não dá pra entrar <= teto."""
+    """(minha_parte_%, deal_price|None, preco_final, meli_%) ou None se não dá pra ofertar.
+    meli_% > 0 => ML co-participa (teto COOP); meli_% == 0 => 100% sua conta (teto PROPRIO)."""
     orig = float(it.get("original_price", 0) or 0)
     if orig <= 0:
         return None
     if tipo == "SMART":
         meu   = float(it.get("seller_percentage", 0) or 0)    # ML já define a oferta; sua parte vem pronta
+        meli  = float(it.get("meli_percentage", 0) or 0)      # quanto a ML banca
         preco = float(it.get("price", 0) or 0)
-        return (round(meu, 2), None, round(preco, 2))         # SMART entra por offer_id
+        return (round(meu, 2), None, round(preco, 2), round(meli, 2))   # SMART entra por offer_id
     if tipo == "DEAL":
         maxp = float(it.get("max_discounted_price", 0) or 0)  # maior preço aceito = MENOR desconto exigido
         if maxp <= 0:
             return None
         meu = round((orig - maxp) / orig * 100, 2)
-        return (meu, round(maxp, 2), round(maxp, 2))
+        return (meu, round(maxp, 2), round(maxp, 2), 0.0)     # DEAL = 100% sua conta (sem co-participação)
     return None
 
 
@@ -493,7 +501,7 @@ def processar_promocoes(conta):
         return
     campanhas = (res.get("data") or {}).get("results", []) or []
     modo = "🧪 DRY (simulando)" if DRY_RUN_PROMO else "✍️  REAL"
-    log.info(f"[{nome}] 🏷️  {len(campanhas)} campanha(s) | {modo} | teto sua parte {MAX_DESCONTO_MEU}%")
+    log.info(f"[{nome}] 🏷️  {len(campanhas)} campanha(s) | {modo} | teto coop {MAX_DESCONTO_COOP}% / próprio {MAX_DESCONTO_PROPRIO}%")
 
     inscritos_conta = 0
     ja_vistos = set()   # não inscreve o mesmo item em 2 campanhas na mesma rodada
@@ -511,6 +519,7 @@ def processar_promocoes(conta):
         if status not in ("started", "pending"):
             continue
 
+        teto_camp = MAX_DESCONTO_COOP if tipo == "SMART" else MAX_DESCONTO_PROPRIO
         ins = caros = piso = kers = 0
         search_after = None
         paginas = 0
@@ -539,9 +548,11 @@ def processar_promocoes(conta):
                 oferta = _oferta_do_item(it, tipo)
                 if not oferta:
                     continue
-                meu_pct, deal_price, preco_final = oferta
+                meu_pct, deal_price, preco_final, meli_pct = oferta
 
-                if meu_pct > MAX_DESCONTO_MEU:
+                # ML co-participa? -> teto COOP (7%). 100% sua conta? -> teto PROPRIO (5%).
+                teto = MAX_DESCONTO_COOP if meli_pct > 0 else MAX_DESCONTO_PROPRIO
+                if meu_pct > teto:
                     caros += 1
                     continue
                 if preco_final and preco_final < PRECO_MINIMO:
@@ -579,7 +590,7 @@ def processar_promocoes(conta):
         inscritos_conta += ins
         stats[cid]["promocoes_ativadas"]  += ins
         stats[cid]["promocoes_ignoradas"] += caros
-        log.info(f"[{nome}] 🏷️  {nome_p}: inscritos {ins} | caros>{MAX_DESCONTO_MEU}% {caros} | piso {piso} | kers {kers}")
+        log.info(f"[{nome}] 🏷️  {nome_p}: inscritos {ins} | caros>{teto_camp}% {caros} | piso {piso} | kers {kers}")
 
         if (not DRY_RUN_PROMO) and TESTE_N_PROMO and inscritos_conta >= TESTE_N_PROMO:
             log.info(f"[{nome}] 🧪 limite de teste ({TESTE_N_PROMO}) atingido — parando conta.")
@@ -596,7 +607,7 @@ def main():
     log.info("🚀 INFINITY BOT iniciado!")
     log.info(f"   Contas ML   : {[c['nome'] for c in CONTAS_ML]}")
     log.info(f"   Intervalo   : {INTERVALO_SEG}s")
-    log.info(f"   Desc. máx.  : {MAX_DESCONTO_MEU}%")
+    log.info(f"   Desc. máx.  : coop {MAX_DESCONTO_COOP}% / próprio {MAX_DESCONTO_PROPRIO}%")
 
     if not MAC_API_KEY:
         log.error("❌ MAC_API_KEY não configurada!"); return
