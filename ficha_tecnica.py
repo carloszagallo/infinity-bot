@@ -1,466 +1,242 @@
-import os
-import time
-import json
-import logging
-import requests
-from datetime import datetime
-from urllib.parse import quote
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+desconto_full_afeta.py - Aplica PRICE_DISCOUNT VARIAVEL nos anuncios "afeta metrica"
+do Full (conta INFINITY 60771984), pra forcar venda antes da avaliacao de metrica do dia 15.
 
-# ── Configurações ──────────────────────────────────────────────
-MAC_API_KEY    = os.environ.get("MAC_API_KEY", "")
-CLAUDE_API_KEY = os.environ.get("CLAUDE_API_KEY", "")
+- Regua variavel por item (mapa PLANO: MLB -> %), definida com o Claude (giro x tempo x preco).
+- Respeita o limite da ML por item (min/max do PRICE_DISCOUNT) -> faz CLAMP, nunca grava fora.
+- DRY_RUN por padrao (NAO grava). Poe DRY_RUN=false pra valer.
+- Roda no FICHARIO via START_SCRIPT=desconto_full_afeta.py
+- Os 5 caros sem giro NAO entram aqui (sao pra REMOVER do Full a mao) - listados no fim.
 
-# Relatório via Telegram (SMTP não funciona no Railway — porta bloqueada).
-# Reaproveita o MESMO token/chat do Atendente.
-TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+Envs:
+  MAC_API_KEY   (ja existe no Railway)
+  CONTA         (default 60771984 = INFINITY)
+  DRY_RUN       (default true)            -> false pra gravar
+  TESTE_N       (default 0 = todos)       -> em REAL limita aos N primeiros (teste)
+  START_DATE    (default hoje 00:00, LOCAL SEM fuso)
+  FINISH_DATE   (default hoje+30d 23:59:59)
+  PAUSA         (default 1.5s entre itens)
+  TELEGRAM_TOKEN / TELEGRAM_CHAT_ID (opcional)
+"""
+import os, time, json, datetime, requests
 
-MAC_BASE_URL  = "https://mcp.tiops.com.br/marketplace"
-HEALTH_MINIMO = float(os.environ.get("HEALTH_MINIMO", "0.80"))
-LOTE_SIZE     = int(os.environ.get("LOTE_SIZE", "50"))
+MAC_BASE_URL = "https://mcp.tiops.com.br/marketplace"
+MAC_API_KEY  = os.environ.get("MAC_API_KEY", "")
+CONTA        = os.environ.get("CONTA", "60771984").strip()
+DRY_RUN      = os.environ.get("DRY_RUN", "true").lower() == "true"
+TESTE_N      = int(os.environ.get("TESTE_N", "0"))
+PAUSA        = float(os.environ.get("PAUSA", "1.5"))
+DORMIR_FIM   = os.environ.get("DORMIR_FIM", "true").lower() == "true"  # fica Online sem re-rodar
+TG_TOKEN     = os.environ.get("TELEGRAM_TOKEN", "")
+TG_CHAT      = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-# Segurança e robustez
-DRY_RUN          = os.environ.get("DRY_RUN", "true").lower() == "true"      # true = só simula, não grava
-RUN_ON_START     = os.environ.get("RUN_ON_START", "false").lower() == "true"  # roda uma vez ao subir
-PAUSA_PAGINA     = float(os.environ.get("PAUSA_PAGINA", "0.4"))
-PAUSA_UPDATE     = float(os.environ.get("PAUSA_UPDATE", "0.5"))
-MAX_ERROS_PAGINA = int(os.environ.get("MAX_ERROS_PAGINA", "5"))   # erros seguidos antes de desistir da conta
-MAX_ANUNCIOS     = int(os.environ.get("MAX_ANUNCIOS", "25000"))   # teto de segurança por conta
-INTERVALO_HORAS  = float(os.environ.get("INTERVALO_HORAS", "24"))  # repete a cada X horas (24 = todo dia; bota 6 no catch-up)
+_hoje = datetime.date.today()
+START_DATE  = os.environ.get("START_DATE",  _hoje.strftime("%Y-%m-%dT00:00:00"))
+FINISH_DATE = os.environ.get("FINISH_DATE", (_hoje + datetime.timedelta(days=30)).strftime("%Y-%m-%dT23:59:59"))
 
-# ── Memória persistente (Railway Volume em /data) ──────────────
-CHECKPOINT_DIR  = os.environ.get("CHECKPOINT_DIR", "/data")
-CHECKPOINT_FILE = os.path.join(CHECKPOINT_DIR, "fichario_checkpoint.txt")
+# ---- PLANO: MLB -> % de desconto (regua variavel) ----
+PLANO = {
+    "MLB1413592162": 22,
+    "MLB6167284256": 15,
+    "MLB3989908885": 12,
+    "MLB3647046008": 22,
+    "MLB5481853078": 15,
+    "MLB3744632587": 15,
+    "MLB4504176277": 15,
+    "MLB3993704215": 15,
+    "MLB4361014705": 15,
+    "MLB3063824440": 30,
+    "MLB3722151281": 30,
+    "MLB4678641755": 30,
+    "MLB3723261811": 30,
+    "MLB4504150467": 15,
+    "MLB6487806288": 30,
+    "MLB5486609934": 18,
+    "MLB4152561271": 22,
+    "MLB1604316997": 18,
+    "MLB2719367752": 12,
+    "MLB4570794793": 12,
+    "MLB4119680803": 15,
+    "MLB4240721885": 15,
+    "MLB1870702121": 18,
+    "MLB2145031195": 18,
+    "MLB3722135963": 22,
+    "MLB4278165781": 12,
+    "MLB4419647431": 22,
+    "MLB4334439719": 18,
+    "MLB1870688765": 30,
+    "MLB3721977613": 30,
+    "MLB3235749183": 15,
+    "MLB3373608263": 30,
+    "MLB1881218276": 15,
+    "MLB1413578947": 22,
+    "MLB4353799797": 30,
+    "MLB3824072875": 18,
+    "MLB1413611297": 15,
+    "MLB1870707978": 22,
+    "MLB5870602510": 12,
+    "MLB3990062571": 15,
+    "MLB2103149125": 22,
+    "MLB5958109976": 22,
+    "MLB1217397118": 30,
+    "MLB4115532875": 30,
+    "MLB4546363741": 30,
+    "MLB1917614525": 15,
+    "MLB2690140423": 22,
+    "MLB3358389299": 22,
+    "MLB1413617890": 15,
+    "MLB5957463514": 15,
+    "MLB4518795977": 12,
+    "MLB5870499186": 22,
+    "MLB1428907038": 15,
+    "MLB4278231367": 15,
+    "MLB4132869897": 12,
+    "MLB4110153551": 22,
+    "MLB6550334030": 30,
+    "MLB5292858480": 15,
+    "MLB3135255216": 15,
+    "MLB1882759741": 12,
+    "MLB3989945329": 30,
+    "MLB4783810848": 12,
+    "MLB1413588923": 15,
+    "MLB5303220218": 30,
+    "MLB4546366315": 30,
+    "MLB1872805638": 30,
+    "MLB1413617570": 22,
+    "MLB4119628529": 15,
+    "MLB1740670300": 12,
+    "MLB4278084923": 30,
+    "MLB6487823446": 30,
+    "MLB1444722240": 12,
+    "MLB5773627216": 22,
+    "MLB3373239055": 30,
+    "MLB3902587073": 25,
+    "MLB4115596159": 15,
+    "MLB6482758670": 22,
+    "MLB6433828222": 12,
+    "MLB4278087867": 12,
+    "MLB3790166904": 22,
+    "MLB3989975039": 12,
+    "MLB3235768164": 15,
+    "MLB1910557515": 22,
+    "MLB1717304431": 30,
+    "MLB1341164291": 15,
+    "MLB4319949435": 30
+}
 
-CONTAS_ML = [
-    {"id": 60771984,  "nome": "INFINITY AUTOPARTS"},
-    {"id": 233798434, "nome": "FREEDOM"},
-    {"id": 554248644, "nome": "AUTOPARTSLIBERTY"},
-    {"id": 1994875400,"nome": "DESTINYAUTOPARTS"},
+# ---- 5 caros sem giro: REMOVER do Full a mao (nao descontar) ----
+REMOVER = [
+    {
+        "mlb": "MLB5307324762",
+        "prod": "Bomba Combustível Gasolina Volvo T5 Xc",
+        "price": 604.89
+    },
+    {
+        "mlb": "MLB4504297407",
+        "prod": "Tampa De Valvula Lado Direito Motor Am",
+        "price": 601.53
+    },
+    {
+        "mlb": "MLB1413618932",
+        "prod": "Radiador Resfriador De Oleo Journey Ch",
+        "price": 638.48
+    },
+    {
+        "mlb": "MLB3782578127",
+        "prod": "Motor Limpador Gol Fox G5 G6 2010/ 1vw",
+        "price": 324.74
+    },
+    {
+        "mlb": "MLB4353312627",
+        "prod": "Trocador Calor Resfriador Óleo Motor J",
+        "price": 602.16
+    }
 ]
 
-# Atributos que vale a pena tentar completar (foco na ficha técnica de autopeça).
-# O código só mexe nos que NÃO são read_only / hidden na categoria.
-CAMPOS_ALVO = {"BRAND", "MODEL", "PART_NUMBER", "VEHICLE_TYPE", "ORIGIN",
-               "OEM", "IS_KIT", "ITEM_CONDITION", "NUMBER_OF_FANS"}
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-log = logging.getLogger("FichaTecnica")
-
-SYSTEM_PROMPT = """Você é um especialista em autopeças preenchendo atributos de anúncios do Mercado Livre.
-Recebe o TÍTULO do anúncio e uma lista de ATRIBUTOS FALTANTES (cada um com seus valores permitidos, quando houver).
-Preencha SOMENTE os atributos que conseguir deduzir com CERTEZA ABSOLUTA a partir do título.
-
-Regras ESTRITAS:
-1. Na dúvida, NÃO preencha — é melhor deixar de fora do que errar.
-2. Quando o atributo tiver lista de valores permitidos, use EXATAMENTE um desses nomes.
-3. Condição do item: sempre "Novo" (todos os nossos produtos são novos).
-4. NUNCA invente informação que não esteja no título.
-
-Responda APENAS em JSON, sem texto fora dele:
-{"atributos": [{"id": "ATRIBUTO_ID", "value_name": "VALOR"}]}
-Se não tiver certeza de nenhum, responda: {"atributos": []}"""
-
-
-# ── MAC API ────────────────────────────────────────────────────
 def mac_call(action, params=None, meli_user_id=None):
-    # roteamento por conta vai DENTRO de params (no topo eh ignorado -> token INFINITY)
     params = dict(params or {})
     if meli_user_id:
         params["meli_user_id"] = meli_user_id
     payload = {"action": action, "params": params}
     headers = {"Content-Type": "application/json", "x-api-key": MAC_API_KEY}
     try:
-        r = requests.post(MAC_BASE_URL, json=payload, headers=headers, timeout=40)
+        r = requests.post(MAC_BASE_URL, json=payload, headers=headers, timeout=30)
         return r.json()
     except Exception as e:
-        return {"status": 0, "error": f"exception: {e}"}
+        return {"status": 500, "error": str(e)}
 
-
-# ── Telegram ───────────────────────────────────────────────────
-def tg_send(texto):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        log.warning("TELEGRAM_TOKEN/CHAT_ID não configurados — relatório não enviado. Resumo no log:")
-        log.info(texto.replace("<b>", "").replace("</b>", ""))
+def tg(msg):
+    if not (TG_TOKEN and TG_CHAT):
         return
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    # Telegram limita ~4096 chars por mensagem
-    for i in range(0, len(texto), 3500):
-        pedaco = texto[i:i + 3500]
-        try:
-            r = requests.post(url, json={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": pedaco,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": True,
-            }, timeout=20)
-            if r.status_code != 200:
-                log.error(f"Erro Telegram ({r.status_code}): {r.text[:200]}")
-        except Exception as e:
-            log.error(f"Erro Telegram: {e}")
-
-
-# ── Memória / checkpoint ───────────────────────────────────────
-def carregar_checkpoint():
-    """Retorna o set de chaves 'cid:iid' já tratadas em passadas anteriores."""
     try:
-        if os.path.exists(CHECKPOINT_FILE):
-            with open(CHECKPOINT_FILE, "r", encoding="utf-8") as f:
-                feitos = {ln.strip() for ln in f if ln.strip()}
-            log.info(f"🧠 Memória: retomando — {len(feitos)} itens já tratados serão pulados.")
-            return feitos
-    except Exception as e:
-        log.warning(f"Não consegui ler o checkpoint ({e}). Começando do zero nesta passada.")
-    return set()
+        requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                      json={"chat_id": TG_CHAT, "text": msg}, timeout=15)
+    except Exception:
+        pass
 
+def detalhes_pd(mlb):
+    """(original_price, min_dp, max_dp) do PRICE_DISCOUNT do item, ou None."""
+    res = mac_call("raw", {"method": "GET",
+                           "path": f"/seller-promotions/items/{mlb}?app_version=v2"},
+                   meli_user_id=CONTA)
+    if res.get("status") != 200:
+        return None
+    for of in (res.get("data") or []):
+        if of.get("type") == "PRICE_DISCOUNT":
+            return (of.get("original_price"), of.get("min_discounted_price"), of.get("max_discounted_price"))
+    return None
 
-def marcar_feito(chave):
-    """Acrescenta uma chave 'cid:iid' ao arquivo de memória (append, à prova de queda)."""
-    try:
-        with open(CHECKPOINT_FILE, "a", encoding="utf-8") as f:
-            f.write(chave + "\n")
-    except Exception as e:
-        log.warning(f"Não consegui gravar no checkpoint ({e}).")
+def aplicar(mlb, pct):
+    d = detalhes_pd(mlb)
+    if not d:
+        return ("SEM_PD", None, None)
+    orig, mn, mx = d
+    if not orig:
+        return ("SEM_PRECO", None, None)
+    dp = round(orig * (1 - pct / 100.0), 2)
+    clamp = ""
+    if mx is not None and dp > mx:   # meu desconto raso demais p/ a ML -> usa o minimo dela
+        dp = mx; clamp = " (clamp->max)"
+    if mn is not None and dp < mn:   # meu desconto fundo demais -> trava no minimo permitido
+        dp = mn; clamp = " (clamp->min)"
+    if DRY_RUN:
+        return ("DRY" + clamp, orig, dp)
+    res = mac_call("raw", {"method": "POST",
+                           "path": f"/seller-promotions/items/{mlb}?app_version=v2",
+                           "body": {"promotion_type": "PRICE_DISCOUNT", "deal_price": dp,
+                                    "start_date": START_DATE, "finish_date": FINISH_DATE}},
+                   meli_user_id=CONTA)
+    if res.get("status") == 201:
+        return ("OK" + clamp, orig, dp)
+    return (f"ERRO {res.get('status')}: {str((res.get('data') or {}).get('message',''))[:60]}", orig, dp)
 
-
-def limpar_checkpoint():
-    """Zera a memória ao terminar uma passada completa nas 4 contas."""
-    try:
-        if os.path.exists(CHECKPOINT_FILE):
-            os.remove(CHECKPOINT_FILE)
-            log.info("🧠 Passada completa concluída — memória limpa para a próxima rodada.")
-    except Exception as e:
-        log.warning(f"Não consegui limpar o checkpoint ({e}).")
-
-
-# ── Atributos da categoria (com cache) ─────────────────────────
-_cache_categoria = {}
-
-def campos_da_categoria(category_id):
-    """Atributos PREENCHÍVEIS da categoria (sem read_only/hidden), com valores permitidos."""
-    if category_id in _cache_categoria:
-        return _cache_categoria[category_id]
-
-    res = mac_call("category_attributes", {"categoryId": category_id})
-    if res.get("status") != 200 or not isinstance(res.get("data"), list):
-        _cache_categoria[category_id] = []
-        return []
-
-    campos = []
-    for a in res["data"]:
-        tags = a.get("tags") or {}
-        if tags.get("read_only") or tags.get("hidden"):
-            continue
-        if a.get("id") not in CAMPOS_ALVO:
-            continue
-        campos.append({
-            "id": a.get("id"),
-            "name": a.get("name", a.get("id")),
-            "value_type": a.get("value_type"),
-            "values": a.get("values") or [],
-            "required": bool(tags.get("required") or tags.get("catalog_required") or tags.get("fixed")),
-        })
-    _cache_categoria[category_id] = campos
-    return campos
-
-
-# ── Claude AI ──────────────────────────────────────────────────
-def analisar_com_claude(titulo, faltantes):
-    linhas = []
-    for f in faltantes:
-        if f["values"]:
-            permitidos = ", ".join(v.get("name", "") for v in f["values"])
-            linhas.append(f"- {f['id']} ({f['name']}) — valores permitidos: {permitidos}")
-        else:
-            linhas.append(f"- {f['id']} ({f['name']}) — texto livre")
-    body = {
-        "model": "claude-haiku-4-5-20251001",
-        "max_tokens": 500,
-        "system": SYSTEM_PROMPT,
-        "messages": [{
-            "role": "user",
-            "content": f"TÍTULO: {titulo}\n\nATRIBUTOS FALTANTES:\n" + "\n".join(linhas),
-        }],
-    }
-    headers = {
-        "Content-Type": "application/json",
-        "x-api-key": CLAUDE_API_KEY,
-        "anthropic-version": "2023-06-01",
-    }
-    try:
-        r = requests.post("https://api.anthropic.com/v1/messages",
-                          json=body, headers=headers, timeout=40)
-        data = r.json()
-        if data.get("content"):
-            texto = data["content"][0]["text"].strip()
-            texto = texto.replace("```json", "").replace("```", "").strip()
-            ini = texto.find("{")
-            if ini > 0:
-                texto = texto[ini:]
-            try:
-                return json.loads(texto).get("atributos", [])
-            except json.JSONDecodeError:
-                obj, _ = json.JSONDecoder().raw_decode(texto)  # ignora texto extra após o JSON
-                return obj.get("atributos", [])
-    except Exception as e:
-        log.error(f"Erro Claude: {e}")
-    return []
-
-
-# ── Monta atributo final, mapeando value_id quando for lista ───
-def montar_attr(campo, value_name):
-    attr = {"id": campo["id"], "value_name": value_name}
-    if campo["values"]:
-        for v in campo["values"]:
-            if (v.get("name") or "").strip().lower() == (value_name or "").strip().lower():
-                attr["value_id"] = v.get("id")
-                attr["value_name"] = v.get("name")
-                break
-        else:
-            return None  # valor fora dos permitidos → descarta por segurança
-    return attr
-
-
-# ── Decide o que preencher em um anúncio ───────────────────────
-def calcular_preenchimentos(item):
-    titulo = item.get("title", "")
-    category_id = item.get("category_id")
-    if not category_id:
-        return []
-
-    campos = campos_da_categoria(category_id)
-    if not campos:
-        return []
-
-    ja_tem = set()
-    for attr in item.get("attributes", []):
-        val = attr.get("value_name")
-        if val and val not in ("", "null", "N/A"):
-            ja_tem.add(attr.get("id"))
-
-    faltantes = [c for c in campos if c["id"] not in ja_tem]
-    if not faltantes:
-        return []
-
-    novos = []
-    pra_ia = []
-    for c in faltantes:
-        if c["id"] == "ITEM_CONDITION":
-            a = montar_attr(c, "Novo")
-            if a:
-                novos.append(a)
-            continue
-        if c["value_type"] == "list" and len(c["values"]) == 1:
-            a = montar_attr(c, c["values"][0].get("name"))
-            if a:
-                novos.append(a)
-            continue
-        if c["id"] == "IS_KIT":
-            ehkit = any(k in titulo.lower() for k in ["kit", "par", "jogo", "conjunto", "c/ 4", "c/4"])
-            a = montar_attr(c, "Sim" if ehkit else "Não")
-            if a:
-                novos.append(a)
-            continue
-        pra_ia.append(c)
-
-    if pra_ia:
-        for sugestao in analisar_com_claude(titulo, pra_ia):
-            campo = next((c for c in pra_ia if c["id"] == sugestao.get("id")), None)
-            if campo:
-                a = montar_attr(campo, sugestao.get("value_name"))
-                if a:
-                    novos.append(a)
-
-    return novos
-
-
-# ── Processa uma conta ─────────────────────────────────────────
-def _scan_ids(cid, nome):
-    """Junta TODOS os ids ativos da conta via scan/scroll.
-    Usa search_type=scan (scroll_id) que FURA o teto de offset=1.000 do ML —
-    diferente do list_items por offset, que morria na página 1050."""
-    ids = []
-    scroll_id = None
-    erros_seguidos = 0
-    total_logado = False
-    while len(ids) < MAX_ANUNCIOS:
-        q = ["search_type=scan", "limit=100", "status=active"]
-        if scroll_id:
-            q.append(f"scroll_id={quote(scroll_id, safe='')}")
-        p = f"/users/{cid}/items/search?" + "&".join(q)
-        res = mac_call("raw", {"method": "GET", "path": p}, meli_user_id=cid)
-
-        if res.get("status") != 200 or "data" not in res:
-            erros_seguidos += 1
-            log.warning(f"[{nome}] ⚠️ Falha no scan: {res.get('error')} "
-                        f"({erros_seguidos}/{MAX_ERROS_PAGINA})")
-            if erros_seguidos >= MAX_ERROS_PAGINA:
-                log.error(f"[{nome}] Muitos erros seguidos no scan — interrompendo esta conta.")
-                break
-            time.sleep(2)
-            continue
-        erros_seguidos = 0
-
-        data = res["data"]
-        if not total_logado:
-            total = (data.get("paging") or {}).get("total")
-            log.info(f"[{nome}] Total de anúncios ativos: {total}")
-            total_logado = True
-
-        scroll_id = data.get("scroll_id") or scroll_id
-        lote = data.get("results", [])
-        if not lote:
-            break
-        ids += lote
-        time.sleep(PAUSA_PAGINA)
-
-    return ids[:MAX_ANUNCIOS]
-
-
-def processar_conta(conta, feitos):
-    cid, nome = conta["id"], conta["nome"]
-    stats = {"verificados": 0, "preenchidos": 0, "sem_alteracao": 0,
-             "erros": 0, "anuncios_atualizados": 0, "pulados": 0}
-    log.info(f"[{nome}] 🔍 Buscando anúncios com health < {HEALTH_MINIMO}...")
-
-    ids = _scan_ids(cid, nome)
-
-    # Multiget de 20 em 20 (ML aceita até 20 ids por chamada). Traz health +
-    # array de atributos numa tacada só, pra decidir E preencher.
-    CAMPOS = "id,health,status,title,attributes"
-    for i in range(0, len(ids), 20):
-        bloco = ids[i:i + 20]
-        res = mac_call("raw", {"method": "GET",
-                       "path": f"/items?ids={','.join(bloco)}&attributes={CAMPOS}"},
-                       meli_user_id=cid)
-        if res.get("status") != 200 or "data" not in res:
-            log.warning(f"[{nome}] ⚠️ Falha no multiget (bloco {i}): {res.get('error')}")
-            stats["erros"] += 1
-            time.sleep(2)
-            continue
-
-        for entry in res["data"]:
-            if entry.get("code") != 200:
-                continue
-            item = entry.get("body") or {}
-            try:
-                if item.get("status") != "active":
-                    continue
-                health = float(item.get("health") or 0)
-                if health >= HEALTH_MINIMO:
-                    continue
-                stats["verificados"] += 1
-
-                item_id = item.get("id")
-                chave = f"{cid}:{item_id}"
-                if chave in feitos:
-                    stats["pulados"] += 1
-                    continue
-
-                novos = calcular_preenchimentos(item)
-                if not novos:
-                    stats["sem_alteracao"] += 1
-                    marcar_feito(chave)
-                    continue
-
-                titulo = item.get("title", "")[:45]
-                if DRY_RUN:
-                    log.info(f"[{nome}] 🧪 [SIMULAÇÃO] {item_id} | {len(novos)} attr | "
-                             f"{[a['id'] for a in novos]} | {titulo}")
-                    stats["preenchidos"] += len(novos)
-                    stats["anuncios_atualizados"] += 1
-                    marcar_feito(chave)
-                    continue
-
-                res2 = mac_call("raw", {"method": "PUT", "path": f"/items/{item_id}", "body": {"attributes": novos}}, meli_user_id=cid)
-                if res2.get("status") in (200, 201):
-                    log.info(f"[{nome}] ✅ {item_id} | {len(novos)} attr | {titulo}")
-                    stats["preenchidos"] += len(novos)
-                    stats["anuncios_atualizados"] += 1
-                    marcar_feito(chave)
-                else:
-                    log.warning(f"[{nome}] ⚠️ Update falhou {item_id}: {res2.get('error')}")
-                    stats["erros"] += 1   # não marca → tenta de novo na próxima passada
-                time.sleep(PAUSA_UPDATE)
-            except Exception as e:
-                log.error(f"[{nome}] Erro no item {item.get('id')}: {e}")
-                stats["erros"] += 1
-
-    log.info(f"[{nome}] ✅ Concluído: {stats}")
-    return stats
-
-
-# ── Relatório via Telegram ─────────────────────────────────────
-def enviar_relatorio(stats_contas):
-    agora = datetime.now().strftime("%d/%m/%Y às %H:%M")
-    modo = "🧪 SIMULAÇÃO (DRY_RUN)" if DRY_RUN else "🚀 PRODUÇÃO"
-    linhas = [f"<b>📋 Relatório Fichas Técnicas</b>", f"{agora} • {modo}", ""]
-    tot = {"verificados": 0, "preenchidos": 0, "anuncios_atualizados": 0,
-           "sem_alteracao": 0, "erros": 0, "pulados": 0}
-    for nome, s in stats_contas.items():
-        for k in tot:
-            tot[k] += s.get(k, 0)
-        linhas.append(
-            f"<b>{nome}</b>\n"
-            f"  📋 Verificados (health baixo): {s['verificados']}\n"
-            f"  ✅ Atributos preenchidos: {s['preenchidos']}\n"
-            f"  📦 Anúncios atualizados: {s['anuncios_atualizados']}\n"
-            f"  ⏭️ Sem alteração: {s['sem_alteracao']}\n"
-            f"  🧠 Pulados (memória): {s.get('pulados', 0)}\n"
-            f"  ❌ Erros: {s['erros']}"
-        )
-    linhas.append("")
-    linhas.append(f"<b>TOTAL</b> — ✅ {tot['preenchidos']} attr em "
-                  f"{tot['anuncios_atualizados']} anúncios • ❌ {tot['erros']} erros")
-    tg_send("\n".join(linhas))
-
-
-# ── Rodada completa ────────────────────────────────────────────
-def rodar():
-    log.info(f"📋 Iniciando rodada — modo {'SIMULAÇÃO' if DRY_RUN else 'PRODUÇÃO'}")
-    feitos = carregar_checkpoint()
-    stats_contas = {}
-    completou_tudo = True
-    for conta in CONTAS_ML:
-        try:
-            stats_contas[conta["nome"]] = processar_conta(conta, feitos)
-        except Exception as e:
-            log.error(f"Erro na conta {conta['nome']}: {e}")
-            completou_tudo = False
-            stats_contas[conta["nome"]] = {"verificados": 0, "preenchidos": 0, "sem_alteracao": 0,
-                                           "erros": 1, "anuncios_atualizados": 0, "pulados": 0}
-    enviar_relatorio(stats_contas)
-    if completou_tudo:
-        limpar_checkpoint()
-    log.info("📋 Rodada concluída!")
-
-
-# ── MAIN ───────────────────────────────────────────────────────
 def main():
-    log.info("📋 BOT FICHAS TÉCNICAS iniciado!")
-    if not MAC_API_KEY:
-        log.error("❌ MAC_API_KEY não configurada!"); return
-    if not CLAUDE_API_KEY:
-        log.error("❌ CLAUDE_API_KEY não configurada!"); return
-
-    try:
-        os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-    except Exception as e:
-        log.warning(f"⚠️ Sem persistência em {CHECKPOINT_DIR} ({e}). "
-                    f"Sem o Volume montado, a memória não sobrevive a restart.")
-
-    # Roda agora ao subir e repete a cada INTERVALO_HORAS (padrão 24h = todo dia).
-    # Quando uma passada parar de preencher coisa nova, é sinal de que zerou o que dava pra zerar.
-    while True:
-        rodar()
-        log.info(f"⏳ Próxima rodada em {INTERVALO_HORAS:.0f}h...")
-        time.sleep(max(60, INTERVALO_HORAS * 3600))
-
+    modo = "DRY (simulacao)" if DRY_RUN else "REAL (gravando)"
+    itens = list(PLANO.items())
+    if (not DRY_RUN) and TESTE_N > 0:
+        itens = itens[:TESTE_N]
+    print(f"=== Desconto Full afeta-metrica | conta {CONTA} | {modo} | {len(itens)} itens | janela {START_DATE} -> {FINISH_DATE} ===")
+    ok = dry = erro = 0
+    for i, (mlb, pct) in enumerate(itens, 1):
+        st, orig, dp = aplicar(mlb, pct)
+        tag = st.split()[0]
+        if tag == "OK": ok += 1
+        elif tag == "DRY": dry += 1
+        else: erro += 1
+        print(f"[{i}/{len(itens)}] {mlb} -{pct}% {orig}->{dp} :: {st}")
+        time.sleep(PAUSA)
+    resumo = (f"Desconto Full ({modo}): OK={ok} DRY={dry} ERRO={erro} de {len(itens)} itens.\n"
+              f"Janela {START_DATE} -> {FINISH_DATE}.\n"
+              f"LEMBRETE - remover do Full a mao (5 caros s/ giro): " + ", ".join(r["mlb"] for r in REMOVER))
+    print("\n" + resumo)
+    tg(resumo)
+    if DORMIR_FIM:
+        print("\nConcluido. Dormindo pra NAO reiniciar/re-rodar no Railway.")
+        print("Quando terminar: remova START_SCRIPT do FICHARIO (volta pro ficha_tecnica.py) e Redeploy.")
+        while True:
+            time.sleep(3600)
 
 if __name__ == "__main__":
     main()
-
